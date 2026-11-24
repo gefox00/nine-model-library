@@ -3,7 +3,8 @@ const { constants: fsConstants } = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
 const os = require('node:os');
-const { EventEmitter } = require('node:events');
+const { EventEmitter, once } = require('node:events');
+const { LibraryStore, parseThumbnail } = require('./library-store.cjs');
 const { detectOpenScad } = require('./scad-engine.cjs');
 const { resolvePreviewLimits, normalizeMemoryBudget, assertMemoryBudget, PREVIEW_MEMORY_CONFIG } = require('../shared/preview-memory.cjs');
 
@@ -15,7 +16,28 @@ const normalize = value => path.resolve(value).replace(/[\\/]+$/, '').toLowerCas
 const idFor = value => crypto.createHash('sha256').update(normalize(value)).digest('hex').slice(0, 24);
 const isInside = (target, directory) => normalize(target) === normalize(directory) || normalize(target).startsWith(normalize(directory) + path.sep.toLowerCase());
 const formatFor = file => formatByExtension.get(path.extname(file).slice(1).toLowerCase());
-const freshData = () => ({ schemaVersion: 1, items: [], folders: [], settings: { bambuPath: '', openscadPath: '', memoryBudgetMiB: normalizeMemoryBudget(undefined) }, excludedPaths: [] });
+const freshData = () => ({ items: [], folders: [], settings: { bambuPath: '', openscadPath: '',
+  memoryBudgetMiB: normalizeMemoryBudget(undefined), lightweightPreview: true }, excludedPaths: [] });
+const newChanges = () => ({ models: new Map(), folders: new Map(), settings: new Map(), excludedPaths: new Map(), thumbnails: new Map() });
+
+function normalizedSettings(settings) {
+  const result = { ...freshData().settings, ...settings };
+  result.memoryBudgetMiB = normalizeMemoryBudget(result.memoryBudgetMiB);
+  if (typeof result.lightweightPreview !== 'boolean') result.lightweightPreview = true;
+  return result;
+}
+
+async function legacyData(file) {
+  let contents;
+  try { contents = await fs.readFile(file, 'utf8'); }
+  catch (error) { if (error.code === 'ENOENT') return freshData(); throw error; }
+  const parsed = JSON.parse(contents);
+  if (parsed?.schemaVersion !== 1 || !Array.isArray(parsed.items) || !Array.isArray(parsed.folders)) {
+    throw new Error('ライブラリの保存形式を読み込めません');
+  }
+  return { items: parsed.items, folders: parsed.folders, settings: normalizedSettings(parsed.settings),
+    excludedPaths: Array.isArray(parsed.excludedPaths) ? parsed.excludedPaths : [] };
+}
 function assertModelSizeAllowed(size, memoryBudgetMiB) {
   assertMemoryBudget(memoryBudgetMiB);
   const limit = resolvePreviewLimits(memoryBudgetMiB).fileBytes;
@@ -31,56 +53,127 @@ class Library extends EventEmitter {
   constructor(dataDir, options = {}) {
     super();
     this.dataDir = path.resolve(dataDir);
-    this.file = path.join(this.dataDir, 'library.json');
+    this.file = path.join(this.dataDir, 'library.sqlite3');
     this.data = freshData();
+    this.itemsById = new Map();
+    this.excluded = new Set();
     this.status = { scanning: false, message: '' };
     this.watchers = [];
     this.queue = Promise.resolve();
+    this.watcherQueue = Promise.resolve();
+    this.watcherLifetime = new AbortController();
+    this.notificationTimer = null;
     this.options = options;
     this.closed = false;
   }
 
-  async init() {
+  async init({ backgroundScan = false } = {}) {
     await fs.mkdir(this.dataDir, { recursive: true });
     try {
-      const parsed = JSON.parse(await fs.readFile(this.file, 'utf8'));
-      if (parsed.schemaVersion !== 1 || !Array.isArray(parsed.items) || !Array.isArray(parsed.folders)) throw new Error('ライブラリの保存形式を読み込めません');
-      this.data = { ...freshData(), ...parsed, settings: { ...freshData().settings, ...parsed.settings } };
-      this.data.settings.memoryBudgetMiB = normalizeMemoryBudget(this.data.settings.memoryBudgetMiB);
-      this.data.excludedPaths = Array.isArray(parsed.excludedPaths) ? parsed.excludedPaths : [];
+      const store = await LibraryStore.open(this.dataDir, legacyData);
+      if (this.closed) {
+        store.close();
+        throw new Error('ライブラリは終了処理中です');
+      }
+      this.store = store;
+      this.data = this.store.load();
+      this.itemsById = new Map(this.data.items.map(item => [item.id, item]));
+      this.excluded = new Set(this.data.excludedPaths);
+      const changes = newChanges();
+      const settings = normalizedSettings(this.data.settings);
+      if (!settings.bambuPath) settings.bambuPath = await this.detectBambu();
+      if (!settings.openscadPath) settings.openscadPath = (await detectOpenScad()) || '';
+      if (this.closed) throw new Error('ライブラリは終了処理中です');
+      for (const [key, value] of Object.entries(settings)) {
+        if (!Object.is(value, this.data.settings[key])) changes.settings.set(key, value);
+      }
+      this.apply(changes);
+      if (backgroundScan) {
+        // A disconnected or slow watch folder must not prevent the window opening.
+        this.status = { scanning: true, message: '監視フォルダを準備しています…' };
+        this.initialScan = this.syncFiles().catch(error => {
+          if (this.closed) return;
+          this.status = { scanning: false, message: `初回のフォルダ確認を保留: ${error.message}` };
+          this.notify();
+        });
+      } else {
+        await this.syncFiles();
+      }
+      return this;
     } catch (error) {
-      if (error.code !== 'ENOENT') throw new Error(`ライブラリを読み込めません。元データは保持しています: ${error.message}`);
+      await this.close().catch(() => {});
+      throw new Error(`ライブラリを読み込めません。元データは保持しています: ${error.message}`, { cause: error });
     }
-    if (!this.data.settings.bambuPath) {
-      this.data.settings.bambuPath = await this.detectBambu();
-    }
-    if (!this.data.settings.openscadPath) {
-      this.data.settings.openscadPath = (await detectOpenScad()) || '';
-    }
-    await this.rescan();
-    await this.startWatchers();
-    return this;
   }
+
+  async syncFiles() {
+    // Reconcile only once, after the watcher is ready, so initial changes cannot be lost.
+    await this.startWatchers();
+    if (!this.closed && !this.watchers.length) await this.rescan();
+  }
+
+  get database() { return this.store?.database; }
 
   getState() {
     return structuredClone({ items: this.data.items, folders: this.data.folders, settings: this.data.settings, status: this.status,
       system: { totalMemoryMiB: Math.floor(os.totalmem() / 1024 / 1024), availableMemoryMiB: Math.floor(os.freemem() / 1024 / 1024) } });
   }
 
-  notify() { if (!this.closed) this.emit('state', this.getState()); }
+  notify(state) {
+    clearTimeout(this.notificationTimer);
+    this.notificationTimer = null;
+    if (!this.closed && this.listenerCount('state')) this.emit('state', state ?? this.getState());
+  }
+
+  scheduleNotification() {
+    if (this.closed || this.notificationTimer || !this.listenerCount('state')) return;
+    // Filesystem bursts or short thumbnail batches share a metadata snapshot.
+    this.notificationTimer = setTimeout(() => this.notify(), 40);
+    this.notificationTimer.unref();
+  }
 
   enqueue(callback) {
+    if (this.closed) return Promise.reject(new Error('ライブラリは終了処理中です'));
     const result = this.queue.then(callback);
     this.queue = result.catch(() => {});
     return result;
   }
 
-  async persist() {
-    const temporary = `${this.file}.${process.pid}.tmp`;
-    await fs.writeFile(temporary, JSON.stringify(this.data, null, 2), 'utf8');
-    // Same-directory rename keeps a half-written JSON file from replacing the library.
-    await fs.rename(temporary, this.file);
-    this.notify();
+  apply(changes, { notify = true } = {}) {
+    if (!Object.values(changes).some(rows => rows.size)) return;
+    this.store.apply(changes);
+    let removedModel = false;
+    for (const [id, model] of changes.models) {
+      const stored = this.itemsById.get(id);
+      if (!model) {
+        removedModel = this.itemsById.delete(id) || removedModel;
+      } else if (stored) {
+        Object.assign(stored, model);
+      } else {
+        this.itemsById.set(id, model);
+        this.data.items.push(model);
+      }
+    }
+    if (removedModel) this.data.items = this.data.items.filter(model => this.itemsById.has(model.id));
+    if (changes.folders.size) {
+      this.data.folders = this.data.folders.filter(folder => !changes.folders.has(folder.id));
+      for (const folder of changes.folders.values()) if (folder) this.data.folders.push(folder);
+    }
+    if (changes.settings.size) this.data.settings = { ...this.data.settings, ...Object.fromEntries(changes.settings) };
+    if (changes.excludedPaths.size) {
+      for (const [key, excluded] of changes.excludedPaths) {
+        if (excluded) this.excluded.add(key);
+        else this.excluded.delete(key);
+      }
+      this.data.excludedPaths = [...this.excluded];
+    }
+    for (const [id, image] of changes.thumbnails) {
+      const model = this.itemsById.get(id);
+      if (!model) continue;
+      model.hasThumbnail = Boolean(image);
+      model.thumbnailRevision = image?.revision ?? null;
+    }
+    if (notify) this.scheduleNotification();
   }
 
   async detectBambu() {
@@ -102,41 +195,43 @@ class Library extends EventEmitter {
     return isInside(file, this.dataDir) || /(?:^|[\\/])(?:node_modules|\.git|\.svn)(?:[\\/]|$)/.test(file);
   }
 
-  async upsert(file, { explicit = false } = {}) {
+  async upsert(file, changes, { explicit = false } = {}) {
     const absolute = path.resolve(file);
     const format = formatFor(absolute);
     if (!format || this.ignored(absolute)) return false;
     const key = normalize(absolute);
-    if (explicit) this.data.excludedPaths = this.data.excludedPaths.filter(p => p !== key);
-    else if (this.data.excludedPaths.includes(key)) return false;
+    const excluded = changes.excludedPaths.get(key) ?? this.excluded.has(key);
+    if (excluded && !explicit) return;
     let stat;
     try { stat = await fs.stat(absolute); }
-    catch (error) { if (error.code === 'ENOENT') return this.markMissing(absolute); throw error; }
-    if (!stat.isFile()) return this.markMissing(absolute);
+    catch (error) { if (error.code === 'ENOENT') return this.markMissing(absolute, changes); throw error; }
+    if (!stat.isFile()) return this.markMissing(absolute, changes);
+    if (excluded) changes.excludedPaths.set(key, false);
     const id = idFor(absolute);
-    const previous = this.data.items.find(item => item.id === id);
+    const previous = changes.models.get(id) ?? this.itemsById.get(id);
     const modifiedAt = stat.mtime.toISOString();
     if (previous) {
       const changed = previous.modifiedAt !== modifiedAt || previous.size !== stat.size || previous.missing;
       if (changed) {
-        Object.assign(previous, { name: path.basename(absolute), path: absolute, format, size: stat.size, modifiedAt, missing: false });
-        delete previous.thumbnail;
+        changes.models.set(id, { ...previous, name: path.basename(absolute), path: absolute, format, size: stat.size, modifiedAt, missing: false });
+        if (previous.hasThumbnail) changes.thumbnails.set(id, null);
       }
-      return Boolean(changed);
+      return;
     }
-    this.data.items.push({ id, name: path.basename(absolute), path: absolute, format, size: stat.size, modifiedAt,
-      addedAt: new Date().toISOString(), missing: false, favorite: false, tags: [], notes: '' });
-    return true;
+    changes.models.set(id, { id, name: path.basename(absolute), path: absolute, format, size: stat.size, modifiedAt,
+      addedAt: new Date().toISOString(), missing: false, favorite: false, tags: [], notes: '', hasThumbnail: false, thumbnailRevision: null });
   }
 
-  markMissing(file) {
-    const item = this.data.items.find(value => value.id === idFor(file));
-    if (item && !item.missing) { item.missing = true; return true; }
-    return false;
+  markMissing(file, changes) {
+    const id = idFor(file);
+    const item = changes.models.get(id) ?? this.itemsById.get(id);
+    if (item && !item.missing) changes.models.set(id, { ...item, missing: true });
   }
 
-  async walk(directory) {
-    if (this.ignored(directory)) return;
+  async walk(directory, changes, visitedFiles, visitedFolders) {
+    const key = normalize(directory);
+    if (this.closed || visitedFolders.has(key) || this.ignored(directory)) return;
+    visitedFolders.add(key);
     let entries;
     try { entries = await fs.readdir(directory, { withFileTypes: true }); }
     catch (error) {
@@ -150,9 +245,10 @@ class Library extends EventEmitter {
       if (this.closed) break;
       const file = path.join(directory, entry.name);
       if (entry.isSymbolicLink() || this.ignored(file)) continue;
-      if (entry.isDirectory()) await this.walk(file);
-      else if (entry.isFile() && formatFor(file)) {
-        try { await this.upsert(file); }
+      if (entry.isDirectory()) await this.walk(file, changes, visitedFiles, visitedFolders);
+      else if (entry.isFile() && formatFor(file) && !visitedFiles.has(normalize(file))) {
+        visitedFiles.add(normalize(file));
+        try { await this.upsert(file, changes); }
         catch (error) { this.status.message = `読み取りを保留: ${path.basename(file)} (${error.code || error.message})`; }
       }
     }
@@ -162,24 +258,41 @@ class Library extends EventEmitter {
     return this.enqueue(async () => {
       this.status = { scanning: true, message: 'フォルダを確認しています…' };
       this.notify();
+      let state;
       try {
         this.status.message = '';
+        const changes = newChanges();
+        const visitedFiles = new Set();
         for (const item of this.data.items) {
-          try { await this.upsert(item.path); }
+          if (this.closed) break;
+          visitedFiles.add(normalize(item.path));
+          try { await this.upsert(item.path, changes); }
           catch (error) { this.status.message = `読み取りを保留: ${item.name} (${error.code || error.message})`; }
         }
-        for (const folder of this.data.folders) await this.walk(folder.path);
-        await this.persist();
-      } finally { this.status.scanning = false; this.notify(); }
-      return this.getState();
+        const visitedFolders = new Set();
+        for (const folder of this.data.folders) await this.walk(folder.path, changes, visitedFiles, visitedFolders);
+        this.apply(changes, { notify: false });
+      } finally {
+        this.status.scanning = false;
+        state = this.getState();
+        this.notify(state);
+      }
+      return state;
     });
   }
 
-  async startWatchers() {
+  startWatchers() {
+    const result = this.watcherQueue.then(() => this.restartWatchers());
+    this.watcherQueue = result.catch(() => {});
+    return result;
+  }
+
+  async restartWatchers() {
     await Promise.all(this.watchers.map(watcher => watcher.close()));
     this.watchers = [];
     if (this.closed || !this.data.folders.length || this.options.watch === false) return;
     const { watch } = await import('chokidar');
+    if (this.closed) return;
     const watcher = watch(this.data.folders.map(folder => folder.path), {
       ignoreInitial: true,
       ignored: file => this.ignored(file),
@@ -191,26 +304,38 @@ class Library extends EventEmitter {
     this.watchers.push(watcher);
     const change = file => {
       if (!formatFor(file) || this.closed) return;
-      this.enqueue(async () => { if (await this.upsert(file)) await this.persist(); })
+      this.enqueue(async () => {
+        const changes = newChanges();
+        await this.upsert(file, changes);
+        this.apply(changes);
+      })
         .catch(error => { this.status.message = `自動登録を保留: ${error.message}`; this.notify(); });
     };
     watcher.on('add', change).on('change', change).on('unlink', file => {
-      this.enqueue(async () => { if (this.markMissing(file)) await this.persist(); })
+      if (this.closed || !formatFor(file)) return;
+      this.enqueue(() => {
+        const changes = newChanges();
+        this.markMissing(file, changes);
+        this.apply(changes);
+      })
         .catch(error => { this.status.message = error.message; this.notify(); });
     }).on('error', error => { this.status.message = `監視エラー: ${error.message}`; this.notify(); });
-    await new Promise((resolve, reject) => { watcher.once('ready', resolve); watcher.once('error', reject); });
+    try { await once(watcher, 'ready', { signal: this.watcherLifetime.signal }); }
+    catch (error) { if (this.closed) return; throw error; }
     // Reconcile changes that happened between the first scan and watcher readiness.
-    await this.rescan();
+    if (!this.closed) await this.rescan();
   }
 
   async addFolder(directory) {
     const absolute = path.resolve(directory);
     if (!(await fs.stat(absolute)).isDirectory()) throw new Error('フォルダを選んでください');
     if (this.ignored(absolute)) throw new Error('このフォルダは監視対象にできません');
-    await this.enqueue(async () => {
+    await this.enqueue(() => {
       if (!this.data.folders.some(folder => normalize(folder.path) === normalize(absolute))) {
-        this.data.folders.push({ id: idFor(absolute), path: absolute });
-        await this.persist();
+        const changes = newChanges();
+        const id = idFor(absolute);
+        changes.folders.set(id, { id, path: absolute });
+        this.apply(changes);
       }
     });
     await this.startWatchers();
@@ -220,9 +345,11 @@ class Library extends EventEmitter {
   }
 
   async removeFolder(id) {
-    await this.enqueue(async () => {
-      this.data.folders = this.data.folders.filter(folder => folder.id !== id);
-      await this.persist();
+    await this.enqueue(() => {
+      if (!this.data.folders.some(folder => folder.id === id)) return;
+      const changes = newChanges();
+      changes.folders.set(id, null);
+      this.apply(changes);
     });
     await this.startWatchers();
     return this.getState();
@@ -230,45 +357,60 @@ class Library extends EventEmitter {
 
   async importPaths(paths) {
     if (!Array.isArray(paths) || paths.length > 10000 || paths.some(file => typeof file !== 'string')) throw new Error('ファイル一覧が不正です');
-    const directories = [];
-    await this.enqueue(async () => {
+    const addedFolder = await this.enqueue(async () => {
+      const changes = newChanges();
+      const knownFolders = new Set(this.data.folders.map(folder => normalize(folder.path)));
       for (const file of paths) {
         const stat = await fs.stat(file);
-        if (stat.isDirectory()) directories.push(file);
-        else if (formatFor(file)) await this.upsert(file, { explicit: true });
+        if (stat.isDirectory()) {
+          const absolute = path.resolve(file);
+          if (this.ignored(absolute)) throw new Error('このフォルダは監視対象にできません');
+          const key = normalize(absolute);
+          if (knownFolders.has(key)) continue;
+          knownFolders.add(key);
+          const id = idFor(absolute);
+          changes.folders.set(id, { id, path: absolute });
+        } else if (formatFor(file)) await this.upsert(file, changes, { explicit: true });
       }
-      await this.persist();
+      this.apply(changes);
+      return Boolean(changes.folders.size);
     });
-    for (const directory of directories) await this.addFolder(directory);
+    if (addedFolder) {
+      await this.startWatchers();
+      if (this.options.watch === false) await this.rescan();
+    }
     return this.getState();
   }
 
   item(id) {
     if (typeof id !== 'string') throw new Error('ファイルIDが不正です');
-    const item = this.data.items.find(value => value.id === id);
+    const item = this.itemsById.get(id);
     if (!item) throw new Error('ライブラリにファイルが見つかりません');
     return item;
   }
 
   updateItem(id, patch) {
-    return this.enqueue(async () => {
-      const item = this.item(id);
+    return this.enqueue(() => {
+      const item = { ...this.item(id) };
       if (!patch || typeof patch !== 'object') throw new Error('更新内容が不正です');
       if (typeof patch.favorite === 'boolean') item.favorite = patch.favorite;
       if (typeof patch.notes === 'string') item.notes = patch.notes.slice(0, 20000);
       if (Array.isArray(patch.tags)) item.tags = [...new Set(patch.tags.filter(tag => typeof tag === 'string').map(tag => tag.trim().slice(0, 60)).filter(Boolean))].slice(0, 30);
-      await this.persist();
+      const changes = newChanges();
+      changes.models.set(id, item);
+      this.apply(changes);
       return this.getState();
     });
   }
 
   removeItem(id) {
-    return this.enqueue(async () => {
+    return this.enqueue(() => {
       const item = this.item(id);
       const key = normalize(item.path);
-      if (!this.data.excludedPaths.includes(key)) this.data.excludedPaths.push(key);
-      this.data.items = this.data.items.filter(value => value.id !== id);
-      await this.persist();
+      const changes = newChanges();
+      changes.excludedPaths.set(key, true);
+      changes.models.set(id, null);
+      this.apply(changes);
       return this.getState();
     });
   }
@@ -312,10 +454,11 @@ class Library extends EventEmitter {
       const item = await this.assertThumbnailSource(id, expectedSource, 'ゴミ箱への移動');
       try { await trash(item.path); }
       catch (error) { throw new Error(`ゴミ箱へ移動できませんでした。ファイルはライブラリに残しています: ${error.message || error}`); }
-      this.data.items = this.data.items.filter(value => value.id !== id);
+      const changes = newChanges();
+      changes.models.set(id, null);
       // Restoring the file into a watched folder must register it again.
-      this.data.excludedPaths = this.data.excludedPaths.filter(value => value !== normalize(item.path));
-      try { await this.persist(); }
+      changes.excludedPaths.set(normalize(item.path), false);
+      try { this.apply(changes); }
       catch (error) {
         this.notify();
         throw new Error(`ファイルはゴミ箱へ移動済みですが、ライブラリの保存に失敗しました: ${error.message}`);
@@ -325,15 +468,21 @@ class Library extends EventEmitter {
   }
 
   updateSettings(patch) {
-    return this.enqueue(async () => {
-      if (!patch || typeof patch !== 'object' || Array.isArray(patch) || Object.keys(patch).some(key => key !== 'memoryBudgetMiB')) {
+    return this.enqueue(() => {
+      if (!patch || typeof patch !== 'object' || Array.isArray(patch) ||
+        Object.keys(patch).some(key => key !== 'memoryBudgetMiB' && key !== 'lightweightPreview')) {
         throw new Error('設定の更新内容が不正です');
       }
+      const changes = newChanges();
       if (Object.hasOwn(patch, 'memoryBudgetMiB')) {
         assertMemoryBudget(patch.memoryBudgetMiB);
-        this.data.settings.memoryBudgetMiB = patch.memoryBudgetMiB;
-        await this.persist();
+        changes.settings.set('memoryBudgetMiB', patch.memoryBudgetMiB);
       }
+      if (Object.hasOwn(patch, 'lightweightPreview')) {
+        if (typeof patch.lightweightPreview !== 'boolean') throw new Error('軽量プレビューの設定が不正です');
+        changes.settings.set('lightweightPreview', patch.lightweightPreview);
+      }
+      this.apply(changes);
       return this.getState();
     });
   }
@@ -395,20 +544,30 @@ class Library extends EventEmitter {
   saveThumbnail(id, dataUrl, expectedSource, options = {}) {
     return this.enqueue(async () => {
       options.signal?.throwIfAborted();
-      const item = expectedSource ? await this.assertThumbnailSource(id, expectedSource) : this.item(id);
-      if (typeof dataUrl !== 'string' || !/^data:image\/(?:png|jpeg|webp);base64,[a-zA-Z0-9+/=]+$/.test(dataUrl) || dataUrl.length > 250000) throw new Error('サムネイル形式またはサイズが不正です');
+      if (expectedSource) await this.assertThumbnailSource(id, expectedSource);
+      else this.item(id);
+      const image = parseThumbnail(dataUrl);
       options.signal?.throwIfAborted();
-      item.thumbnail = dataUrl;
-      await this.persist();
+      const changes = newChanges();
+      changes.thumbnails.set(id, { ...image, revision: crypto.randomUUID() });
+      this.apply(changes);
       return dataUrl;
     });
+  }
+
+  readThumbnail(id, revision) {
+    if (this.closed || typeof id !== 'string') return null;
+    const item = this.itemsById.get(id);
+    if (!item?.hasThumbnail || (revision !== undefined && revision !== item.thumbnailRevision)) return null;
+    return this.store.readThumbnail(id, revision);
   }
 
   setBambu(file) {
     return this.enqueue(async () => {
       if (typeof file !== 'string' || path.extname(file).toLowerCase() !== '.exe' || !(await fs.stat(file)).isFile()) throw new Error('Bambu Studioの実行ファイルを選んでください');
-      this.data.settings.bambuPath = path.resolve(file);
-      await this.persist();
+      const changes = newChanges();
+      changes.settings.set('bambuPath', path.resolve(file));
+      this.apply(changes);
       return this.getState();
     });
   }
@@ -419,18 +578,35 @@ class Library extends EventEmitter {
           !(await fs.stat(file).catch(() => null))?.isFile()) {
         throw new Error('OpenSCADの実行ファイル（.exe）を選んでください');
       }
-      this.data.settings.openscadPath = file;
-      await this.persist();
+      const changes = newChanges();
+      changes.settings.set('openscadPath', file);
+      this.apply(changes);
       return this.getState();
     });
   }
 
-  async close() {
+  close() {
+    if (this.closeTask) return this.closeTask;
     this.closed = true;
-    await Promise.all(this.watchers.map(watcher => watcher.close()));
-    this.watchers = [];
-    await this.queue;
-    this.removeAllListeners();
+    clearTimeout(this.notificationTimer);
+    this.notificationTimer = null;
+    this.watcherLifetime.abort();
+    this.closeTask = this.closeResources();
+    return this.closeTask;
+  }
+
+  async closeResources() {
+    try {
+      await this.watcherQueue;
+      await this.initialScan;
+      await Promise.all(this.watchers.map(watcher => watcher.close()));
+    }
+    finally {
+      this.watchers = [];
+      await this.queue;
+      try { this.store?.close(); }
+      finally { this.removeAllListeners(); }
+    }
   }
 }
 

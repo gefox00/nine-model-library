@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
-import { PREVIEW_MEMORY_CONFIG, resolvePreviewLimits, normalizeMemoryBudget } from '../src/formats/preview-memory.js';
+import { PREVIEW_MEMORY_CONFIG, resolvePreviewLimits, normalizeMemoryBudget, effectivePreviewBudget } from '../src/formats/preview-memory.js';
 const backend = createRequire(import.meta.url)('../shared/preview-memory.cjs');
 
 test('renderer and main process use the same limits for presets and custom budgets', () => {
@@ -9,6 +9,16 @@ test('renderer and main process use the same limits for presets and custom budge
     assert.deepEqual(resolvePreviewLimits(value), backend.resolvePreviewLimits(value));
     assert.equal(normalizeMemoryBudget(value), backend.normalizeMemoryBudget(value));
   }
+});
+
+test('lightweight previews ignore a previously saved high budget until explicitly disabled', () => {
+  for (const settings of [{}, { memoryBudgetMiB: 16384 }, { lightweightPreview: true, memoryBudgetMiB: 16384 }]) {
+    assert.equal(effectivePreviewBudget(settings), 512);
+    assert.equal(backend.effectivePreviewBudget(settings), 512);
+  }
+  const manual = { lightweightPreview: false, memoryBudgetMiB: 1536 };
+  assert.equal(effectivePreviewBudget(manual), 1536);
+  assert.equal(backend.effectivePreviewBudget(manual), 1536);
 });
 
 test('larger budgets expand limits but preserve parser and geometry ceilings', () => {

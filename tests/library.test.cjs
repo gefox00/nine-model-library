@@ -3,7 +3,9 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs/promises');
 const os = require('node:os');
 const path = require('node:path');
-const { Library, assertModelSizeAllowed } = require('../electron/library.cjs');
+const { Library, assertModelSizeAllowed, idFor, normalize } = require('../electron/library.cjs');
+
+const legacy = (settings = {}) => ({ schemaVersion: 1, items: [], folders: [], settings, excludedPaths: [] });
 
 async function fixture(t, options = {}) {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'nine-library-test-'));
@@ -72,6 +74,51 @@ test('watcher handles nested add, write, delete and reappearance; removing folde
   assert.equal(library.getState().items.length, 1);
 });
 
+test('concurrent folder registration keeps both watches and shutdown drains writes', async t => {
+  const { root, models, library } = await fixture(t, { stabilityThreshold: 100 });
+  const second = path.join(root, 'more-models');
+  await fs.mkdir(second);
+  await Promise.all([library.addFolder(models), library.addFolder(second)]);
+  const firstModel = path.join(models, 'first.stl');
+  const secondModel = path.join(second, 'second.stl');
+  await fs.writeFile(firstModel, 'first example');
+  await fs.writeFile(secondModel, 'second example');
+  await eventually(() => library.getState().items.length === 2);
+  const pendingWrite = library.updateItem(idFor(secondModel), { notes: 'finishes before close' });
+  const closing = library.close();
+  assert.equal(library.close(), closing);
+  await Promise.all([pendingWrite, closing]);
+  await assert.rejects(() => library.updateItem(idFor(firstModel), { favorite: true }), /終了処理中/);
+  const reopened = await new Library(path.join(root, 'data'), { watch: false }).init();
+  try { assert.equal(reopened.item(idFor(secondModel)).notes, 'finishes before close'); }
+  finally { await reopened.close(); }
+});
+
+test('background startup exposes stored state before a sluggish watcher becomes ready', { timeout: 4000 }, async t => {
+  const { root, models, library } = await fixture(t, { watch: false });
+  const model = path.join(models, 'saved-model.stl');
+  await fs.writeFile(model, 'example');
+  await library.importPaths([model]);
+  await library.close();
+  const reopened = new Library(path.join(root, 'data'), { watch: false });
+  let release;
+  const delayedWatcher = new Promise(resolve => { release = resolve; });
+  t.mock.method(reopened, 'startWatchers', () => delayedWatcher);
+  try {
+    await reopened.init({ backgroundScan: true });
+    assert.equal(reopened.getState().items[0].id, idFor(model));
+    assert.equal(reopened.getState().status.scanning, true);
+    await fs.unlink(model);
+    release();
+    await reopened.initialScan;
+    assert.equal(reopened.item(idFor(model)).missing, true);
+    assert.equal(reopened.getState().status.scanning, false);
+  } finally {
+    release();
+    await reopened.close();
+  }
+});
+
 test('rescan reconciles missed deletion and modification without losing metadata', async t => {
   const { models, library } = await fixture(t, { watch: false });
   const file = path.join(models, 'part.3mf');
@@ -80,10 +127,13 @@ test('rescan reconciles missed deletion and modification without losing metadata
   const id = library.getState().items[0].id;
   await library.updateItem(id, { notes: 'keep' });
   await library.saveThumbnail(id, 'data:image/png;base64,YWJj');
+  assert.equal(library.item(id).hasThumbnail, true);
+  assert.equal(library.readThumbnail(id), 'data:image/png;base64,YWJj');
   await fs.writeFile(file, 'changed');
   await library.rescan();
   assert.equal(library.item(id).notes, 'keep');
-  assert.equal(library.item(id).thumbnail, undefined);
+  assert.equal(library.item(id).hasThumbnail, false);
+  assert.equal(library.readThumbnail(id), null);
   assert.equal((await library.readModel(id)).length, 7);
   await fs.unlink(file);
   await library.rescan();
@@ -91,13 +141,79 @@ test('rescan reconciles missed deletion and modification without losing metadata
   await assert.rejects(() => library.readModel(id), /見つからない/);
 });
 
-test('corrupt library is preserved and reported instead of overwritten', async t => {
-  const { root, library } = await fixture(t, { watch: false });
-  await library.close();
-  const file = path.join(root, 'data', 'library.json');
+test('corrupt legacy library is preserved and reported instead of overwritten', async t => {
+  const { root } = await fixture(t, { watch: false });
+  const dataDir = path.join(root, 'legacy');
+  await fs.mkdir(dataDir);
+  const file = path.join(dataDir, 'library.json');
   await fs.writeFile(file, '{ corrupt');
-  await assert.rejects(() => new Library(path.join(root, 'data'), { watch: false }).init(), /元データは保持/);
+  await assert.rejects(() => new Library(dataDir, { watch: false }).init(), /元データは保持/);
   assert.equal(await fs.readFile(file, 'utf8'), '{ corrupt');
+  await fs.writeFile(file, JSON.stringify(legacy({ futureSetting: 'successful retry' })));
+  const reopened = await new Library(dataDir, { watch: false }).init();
+  try { assert.equal(reopened.getState().settings.futureSetting, 'successful retry'); }
+  finally { await reopened.close(); }
+});
+
+test('corrupt SQLite does not silently fall back to an older JSON snapshot', async t => {
+  const { root } = await fixture(t, { watch: false });
+  const dataDir = path.join(root, 'corrupt');
+  await fs.mkdir(dataDir);
+  const sqlite = path.join(dataDir, 'library.sqlite3');
+  const fallback = path.join(dataDir, 'library.json');
+  await fs.writeFile(sqlite, 'a damaged SQLite library');
+  await fs.writeFile(fallback, JSON.stringify(legacy()));
+  await assert.rejects(() => new Library(dataDir, { watch: false }).init(), /元データは保持/);
+  assert.equal(await fs.readFile(sqlite, 'utf8'), 'a damaged SQLite library');
+  assert.deepEqual(JSON.parse(await fs.readFile(fallback, 'utf8')), legacy());
+});
+
+test('JSON migration imports SQLite metadata and thumbnail bytes once and retains the JSON backup', async t => {
+  const { root, models } = await fixture(t, { watch: false });
+  const dataDir = path.join(root, 'migration');
+  await fs.mkdir(dataDir);
+  const modelPath = path.join(models, 'model.stl');
+  const excludedPath = path.join(models, 'skip.stl');
+  const legacyFile = path.join(dataDir, 'library.json');
+  const image = 'data:image/webp;base64,YWJj';
+  const seed = legacy({ memoryBudgetMiB: 4096, lightweightPreview: false, futureSetting: { preserved: true } });
+  await fs.writeFile(modelPath, 'kept');
+  await fs.writeFile(excludedPath, 'excluded');
+  const stat = await fs.stat(modelPath);
+  seed.items.push({ id: idFor(modelPath), name: 'model.stl', path: modelPath, format: 'stl', size: stat.size,
+    modifiedAt: stat.mtime.toISOString(), addedAt: stat.ctime.toISOString(), missing: false, favorite: true,
+    tags: ['reference'], notes: 'preserve', thumbnail: image, futureAttribute: 'separate metadata' });
+  seed.folders.push({ id: idFor(models), path: models });
+  seed.excludedPaths.push(normalize(excludedPath));
+  const original = JSON.stringify(seed);
+  await fs.writeFile(legacyFile, original);
+  const library = await new Library(dataDir, { watch: false }).init();
+  const id = seed.items[0].id;
+  try {
+    const state = library.getState();
+    assert.equal(state.items.length, 1);
+    assert.equal(state.items[0].favorite, true);
+    assert.equal(state.items[0].notes, 'preserve');
+    assert.deepEqual(state.items[0].tags, ['reference']);
+    assert.equal(state.items[0].futureAttribute, 'separate metadata');
+    assert.equal(state.items[0].hasThumbnail, true);
+    assert.equal(state.items[0].thumbnail, undefined);
+    assert.deepEqual(state.folders, seed.folders);
+    assert.deepEqual(library.data.excludedPaths, seed.excludedPaths);
+    assert.equal(state.settings.memoryBudgetMiB, 4096);
+    assert.equal(state.settings.lightweightPreview, false);
+    assert.deepEqual(state.settings.futureSetting, { preserved: true });
+    assert.equal(library.readThumbnail(id, state.items[0].thumbnailRevision), image);
+    assert.equal(library.readThumbnail(id, 'stale'), null);
+    assert.deepEqual([...library.database.prepare('SELECT bytes FROM model_thumbnails WHERE model_id = ?').get(id).bytes], [97, 98, 99]);
+    await library.updateItem(id, { notes: 'SQLite current value' });
+  } finally { await library.close(); }
+  assert.equal(await fs.readFile(legacyFile, 'utf8'), original);
+  const reopened = await new Library(dataDir, { watch: false }).init();
+  try {
+    assert.equal(reopened.item(id).notes, 'SQLite current value');
+    assert.equal(reopened.readThumbnail(id), image);
+  } finally { await reopened.close(); }
 });
 
 test('memory settings persist across restart and preserve Bambu path and model metadata', async t => {
@@ -126,34 +242,59 @@ test('memory settings persist across restart and preserve Bambu path and model m
 });
 
 test('legacy and invalid saved memory settings migrate to the default without losing other settings', async t => {
-  const { root, library } = await fixture(t, { watch: false });
-  await library.close();
-  const file = path.join(root, 'data', 'library.json');
+  const { root } = await fixture(t, { watch: false });
   const fixtureBambuPath = path.join(root, 'apps', 'bambu-studio.exe');
-  for (const value of [undefined, null, 128, 32769, 1024.5, '4096']) {
-    const data = JSON.parse(await fs.readFile(file, 'utf8'));
-    data.settings = { bambuPath: fixtureBambuPath, futureSetting: 'preserve', memoryBudgetMiB: value };
-    await fs.writeFile(file, JSON.stringify(data));
-    const reopened = await new Library(path.join(root, 'data'), { watch: false }).init();
+  const values = [undefined, null, 128, 32769, 1024.5, '4096'];
+  for (const [index, value] of values.entries()) {
+    const dataDir = path.join(root, `legacy-${index}`);
+    await fs.mkdir(dataDir);
+    const file = path.join(dataDir, 'library.json');
+    const text = JSON.stringify(legacy({ bambuPath: fixtureBambuPath, futureSetting: 'preserve', memoryBudgetMiB: value, lightweightPreview: 'invalid' }));
+    await fs.writeFile(file, text);
+    const reopened = await new Library(dataDir, { watch: false }).init();
     try {
       assert.equal(reopened.getState().settings.memoryBudgetMiB, 2048);
+      assert.equal(reopened.getState().settings.lightweightPreview, true);
       assert.equal(reopened.getState().settings.bambuPath, fixtureBambuPath);
       assert.equal(reopened.getState().settings.futureSetting, 'preserve');
     } finally { await reopened.close(); }
-    assert.equal(JSON.parse(await fs.readFile(file, 'utf8')).settings.memoryBudgetMiB, 2048);
+    assert.equal(await fs.readFile(file, 'utf8'), text);
   }
 });
 
 test('invalid memory updates cannot change persisted settings or inject executable paths', async t => {
   const { root, library } = await fixture(t, { watch: false });
   await library.updateSettings({ memoryBudgetMiB: 1024 });
-  const before = await fs.readFile(path.join(root, 'data', 'library.json'), 'utf8');
+  const before = library.database.prepare('SELECT * FROM settings ORDER BY key').all();
   for (const value of [undefined, null, 0, 511, 32769, 1024.5, '1024', NaN, Infinity]) {
     await assert.rejects(() => library.updateSettings({ memoryBudgetMiB: value }));
   }
   await assert.rejects(() => library.updateSettings({ memoryBudgetMiB: 4096, bambuPath: path.join(root, 'bad.exe') }));
+  await assert.rejects(() => library.updateSettings({ memoryBudgetMiB: 4096, lightweightPreview: 0 }));
   assert.equal(library.getState().settings.memoryBudgetMiB, 1024);
-  assert.equal(await fs.readFile(path.join(root, 'data', 'library.json'), 'utf8'), before);
+  assert.equal(library.getState().settings.lightweightPreview, true);
+  assert.deepEqual(library.database.prepare('SELECT * FROM settings ORDER BY key').all(), before);
+});
+
+test('a failed write rolls back row deletion, its thumbnail and the in-memory state together', async t => {
+  const { models, library } = await fixture(t, { watch: false });
+  const model = path.join(models, 'part.stl');
+  await fs.writeFile(model, 'example part');
+  await library.importPaths([model]);
+  const id = idFor(model);
+  const image = 'data:image/png;base64,YWJj';
+  await library.saveThumbnail(id, image);
+  library.database.exec(`CREATE TEMP TRIGGER reject_exclusion BEFORE INSERT ON excluded_paths
+    BEGIN SELECT RAISE(ABORT, 'synthetic write failure'); END`);
+  await assert.rejects(() => library.removeItem(id), /synthetic write failure/);
+  assert.equal(library.item(id).hasThumbnail, true);
+  assert.equal(library.readThumbnail(id), image);
+  assert.equal(library.database.prepare('SELECT count(*) AS count FROM models').get().count, 1);
+  assert.equal(library.database.prepare('SELECT count(*) AS count FROM excluded_paths').get().count, 0);
+  library.database.exec('DROP TRIGGER reject_exclusion');
+  await library.removeItem(id);
+  assert.equal(library.database.prepare('SELECT count(*) AS count FROM model_thumbnails').get().count, 0);
+  assert.equal(library.readThumbnail(id), null);
 });
 
 test('file preflight follows the selected memory budget and hard ceiling before reading', async t => {
@@ -247,7 +388,7 @@ test('trash success removes the entry without exclusion, and a restored file reg
   assert.equal(calls, 1);
   assert.equal(result.items.length, 0);
   assert.equal(library.data.excludedPaths.length, 0);
-  assert.equal(JSON.parse(await fs.readFile(path.join(root, 'data', 'library.json'), 'utf8')).items.length, 0);
+  assert.equal(library.database.prepare('SELECT count(*) AS count FROM models').get().count, 0);
   await fs.rename(fakeTrash, file);
   await eventually(() => library.getState().items.length === 1 && !library.getState().items[0].missing);
   assert.equal(library.getState().items[0].id, id);

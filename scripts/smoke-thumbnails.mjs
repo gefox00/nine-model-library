@@ -6,7 +6,9 @@ import { fileURLToPath } from 'node:url';
 
 const root = fileURLToPath(new URL('../', import.meta.url));
 const packaged = process.argv.includes('--packaged');
-const executablePath = path.join(root, packaged ? 'release/win-unpacked/Nine Model Library.exe' : 'node_modules/electron/dist/electron.exe');
+const releaseDirectory = process.argv.find(arg => arg.startsWith('--release-dir='))?.slice('--release-dir='.length) || 'release';
+const executablePath = packaged ? path.resolve(root, releaseDirectory, 'win-unpacked/Nine Model Library.exe')
+  : path.join(root, 'node_modules/electron/dist/electron.exe');
 const out = path.join(root, 'output', 'playwright');
 await fs.mkdir(out, { recursive: true });
 const testDir = await fs.mkdtemp(path.join(out, 'thumb-smoke-'));
@@ -92,11 +94,13 @@ try {
   findings.push('Default batch: 3 generated, 1 invalid STL failed, 2 skipped; processed 6/6');
 
   const generated = await page.evaluate(() => window.nine.getState());
-  assert.equal(generated.items.find(item => item.id === existing.id).thumbnail, knownThumbnail);
+  assert.equal(await page.evaluate(id => window.nine.getThumbnail(id), existing.id), knownThumbnail);
+  assert(generated.items.every(item => !Object.hasOwn(item, 'thumbnail')));
   const imageChecks = [];
   for (const name of ['cube-mm.stl', 'cube-mm.step', 'cube-mm.3mf']) {
     const item = generated.items.find(candidate => candidate.name === name);
-    assert(item.thumbnail && item.thumbnail.length <= 250000, `${name}: thumbnail missing or too large`);
+    const thumbnail = await page.evaluate(id => window.nine.getThumbnail(id), item.id);
+    assert(item.hasThumbnail && thumbnail && thumbnail.length <= 250000, `${name}: thumbnail missing or too large`);
     const check = await page.evaluate(async dataUrl => {
       const image = new Image();
       image.src = dataUrl;
@@ -109,12 +113,12 @@ try {
       let brightPixels = 0;
       for (let i = 0; i < pixels.length; i += 4) if (pixels[i] > 80 && pixels[i + 1] > 90 && pixels[i + 2] > 90) brightPixels++;
       return { width: image.naturalWidth, height: image.naturalHeight, brightPixels };
-    }, item.thumbnail);
+    }, thumbnail);
     assert.deepEqual([check.width, check.height], [480, 360]);
     assert(check.brightPixels > 300, `${name}: model surface is not visible`);
-    const [, mime, content] = item.thumbnail.match(/^data:image\/(png|jpeg|webp);base64,(.+)$/);
+    const [, mime, content] = thumbnail.match(/^data:image\/(png|jpeg|webp);base64,(.+)$/);
     await fs.writeFile(path.join(out, `thumb-${name.replaceAll('.', '-')}${packaged ? '-packaged' : ''}.${mime === 'jpeg' ? 'jpg' : mime}`), Buffer.from(content, 'base64'));
-    imageChecks.push({ name, ...check, dataUrlLength: item.thumbnail.length });
+    imageChecks.push({ name, ...check, dataUrlLength: thumbnail.length });
   }
   findings.push('STL, STEP/WASM via file://, and 3MF produced nonblank 480x360 images; existing Bambu thumbnail was preserved');
   await page.screenshot({ path: path.join(out, `thumbnails-done${packaged ? '-packaged' : ''}.png`) });
@@ -154,7 +158,8 @@ try {
   assert.equal(restoredBatch.status, 'completed');
   assert.deepEqual(restoredBatch.failures, finalBatch.failures);
   assert.equal(restoredBatch.processed, finalBatch.processed);
-  for (const item of beforeRestart.items) assert.equal(restoredLibrary.items.find(candidate => candidate.id === item.id)?.thumbnail, item.thumbnail);
+  for (const item of beforeRestart.items) assert.equal(restoredLibrary.items.find(candidate => candidate.id === item.id)?.thumbnailRevision, item.thumbnailRevision);
+  assert.equal(await page.evaluate(id => window.nine.getThumbnail(id), existing.id), knownThumbnail);
   findings.push('Saved thumbnails and last batch result survived a complete app restart');
   assert.deepEqual(pageErrors, []);
   succeeded = true;

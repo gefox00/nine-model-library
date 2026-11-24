@@ -184,6 +184,36 @@ async function renderScad(options) {
   });
 }
 
+async function writeScadPrintStl(options) {
+  const { sourcePath, directory, values = {}, signal, maxOutputBytes, validateSource } = options;
+  if (!Number.isSafeInteger(maxOutputBytes) || maxOutputBytes <= 84) throw new Error('印刷用STLの容量上限を設定できません');
+  checkAbort(signal);
+  const plan = await prepareScadExport(sourcePath, { values });
+  const job = plan.jobs[0];
+  await validateSource();
+  return withRenderedFile({ ...options, values: job.values, temporaryRoot: directory }, async (output, stat) => {
+    if (stat.size > maxOutputBytes) {
+      throw new Error('印刷用STLが一時ファイルの容量上限を超えました。OpenSCADで形状を簡略化するか、分割して出力してください');
+    }
+    const header = Buffer.alloc(84);
+    const handle = await fs.open(output, 'r');
+    try {
+      const { bytesRead } = await handle.read(header, 0, header.length, 0);
+      const triangles = header.readUInt32LE(80);
+      if (bytesRead !== header.length || !triangles || stat.size !== header.length + 50 * triangles) {
+        throw new Error('OpenSCADが完全なバイナリSTLを生成できなかったため、印刷準備を中止しました');
+      }
+    } finally { await handle.close(); }
+    await validateSource();
+    checkAbort(signal);
+    const destination = path.join(directory, job.name);
+    // Both paths are in this unique, private staging directory. Move the file
+    // without creating a second disk copy or loading its bytes in Electron.
+    await fs.rename(output, destination);
+    return destination;
+  });
+}
+
 function safeStem(value, length = 70) {
   let stem = String(value).replace(/[<>:"/\\|?*\x00-\x1f]/g, '_').replace(/[. ]+$/g, '').slice(0, length);
   if (!stem || /^(con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i.test(stem)) stem = `part_${stem || 'model'}`;
@@ -248,5 +278,5 @@ async function exportScad(options) {
   return result;
 }
 
-module.exports = { detectOpenScad, resolveExecutable, readScadParameters, renderScad, prepareScadExport, exportScad, waitForScadIdle,
+module.exports = { detectOpenScad, resolveExecutable, readScadParameters, renderScad, prepareScadExport, exportScad, writeScadPrintStl, waitForScadIdle,
   MAX_EXPORT_PARTS, MAX_SOURCE_BYTES, DEFAULT_TIMEOUT_MS };

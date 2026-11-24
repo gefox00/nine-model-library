@@ -7,7 +7,9 @@ import { zipSync, strToU8 } from 'fflate';
 
 const root = fileURLToPath(new URL('../', import.meta.url));
 const packaged = process.argv.includes('--packaged');
-const executablePath = path.join(root, packaged ? 'release/win-unpacked/Nine Model Library.exe' : 'node_modules/electron/dist/electron.exe');
+const releaseDirectory = process.argv.find(arg => arg.startsWith('--release-dir='))?.slice('--release-dir='.length) || 'release';
+const executablePath = packaged ? path.resolve(root, releaseDirectory, 'win-unpacked/Nine Model Library.exe')
+  : path.join(root, 'node_modules/electron/dist/electron.exe');
 const launchArgs = packaged ? [] : ['.'];
 const out = path.join(root, 'output', 'playwright');
 await fs.mkdir(out, { recursive: true });
@@ -37,6 +39,7 @@ try {
   findings.push('Directory import registered all 4 fixture files and enabled watch');
   for (const name of ['cube-mm.stl', 'cube-mm.step', 'cube-mm.3mf', 'bambu-components.3mf']) {
     await page.getByRole('button', { name: `モデル ${name}`, exact: true }).click();
+    await page.getByRole('button', { name: '3Dプレビューを読み込む', exact: true }).click();
     await page.locator('[data-testid="model-viewer"][data-phase="ready"]').waitFor({ timeout: 60000 });
     const dimensions = await page.locator('.dimensions b').allTextContents();
     if (name.startsWith('cube-mm')) assert.deepEqual(dimensions, ['20.00','30.00','10.00']);
@@ -63,6 +66,7 @@ try {
   await fs.copyFile(path.join(watchDir,'cube-mm.stl'), nextFile);
   await page.getByRole('button',{name:'モデル 自動登録テスト.stl',exact:true}).waitFor({timeout:15000});
   await page.getByRole('button',{name:'モデル 自動登録テスト.stl',exact:true}).click();
+  await page.getByRole('button', { name: '3Dプレビューを読み込む', exact: true }).click();
   await page.locator('[data-phase="ready"]').waitFor();
   await fs.unlink(nextFile);
   await page.locator('[data-phase="error"]').waitFor({timeout:15000});
@@ -72,7 +76,8 @@ try {
   const saved = await page.evaluate(() => window.nine.getState());
   assert.equal(saved.items.find(i => i.name === 'bambu-components.3mf').notes,'PLA / integration test');
   assert(saved.items.find(i => i.name === 'bambu-components.3mf').favorite);
-  assert(saved.items.filter(i=>i.thumbnail).length >= 4);
+  assert(saved.items.filter(i=>i.hasThumbnail).length >= 4);
+  assert(saved.items.every(i=>!Object.hasOwn(i, 'thumbnail')));
   // Keep extra format coverage self-contained: ASCII STL and a sliced 3MF
   // carrying only an embedded image. Never import a developer's model library.
   const vertices = [[0, 0, 0], [50, 0, 0], [0, 30, 0], [0, 0, 60]];
@@ -97,6 +102,7 @@ try {
   for (const file of [asciiFile, imageFile]) {
     const name = path.basename(file);
     await page.getByRole('button',{name:`モデル ${name}`,exact:true}).click();
+    await page.getByRole('button', { name: '3Dプレビューを読み込む', exact: true }).click();
     await page.waitForFunction(() => ['ready','preview','error'].includes(document.querySelector('[data-testid="model-viewer"]')?.dataset.phase),null,{timeout:90000});
     const phase = await page.locator('[data-testid="model-viewer"]').getAttribute('data-phase');
     assert.equal(phase, file === asciiFile ? 'ready' : 'preview', `${name}: unexpected viewer state`);
@@ -106,8 +112,14 @@ try {
     await page.screenshot({path:path.join(out,file === asciiFile ? 'ascii-tetra.png' : 'image-only-3mf.png')});
   }
   const configuredBambu = (await page.evaluate(() => window.nine.getState())).settings.bambuPath;
+  const studio = await page.evaluate(() => window.nine.getBambuPrintStatus());
+  if (configuredBambu) {
+    assert.equal(studio.available, true);
+    assert.equal(studio.capabilities.printerConfirmationInStudio, true);
+    assert.match(studio.version, /\d+\.\d+/);
+  }
   await page.getByRole('button',{name:'設定と連携',exact:true}).click();
-  const displayedBambu = await page.locator('.path-field').innerText();
+  const displayedBambu = await page.locator('.settings-section').filter({ has: page.getByRole('heading', { name: 'Bambu Studio', exact: true }) }).locator('.path-field').innerText();
   if (configuredBambu) assert.equal(displayedBambu, configuredBambu);
   else assert.match(displayedBambu, /未検出/);
   await page.screenshot({path:path.join(out,'settings.png')});
@@ -123,6 +135,20 @@ try {
   assert.equal(restored.folders.length,1);
   assert.equal(restored.settings.bambuPath, configuredBambu);
   findings.push('Library, favorite, notes and watch folder survived a full app restart');
+  const bulk = await fs.mkdtemp(path.join(testDir, 'paging-'));
+  const models = Array.from({ length: 96 }, (_, index) => path.join(bulk, `paging-${String(index).padStart(3, '0')}.stl`));
+  await Promise.all(models.map(file => fs.copyFile(path.join(watchDir, 'cube-mm.stl'), file)));
+  await restarted.evaluate(files => window.nine.importPaths(files), models);
+  const cards = restarted.locator('.model-card');
+  await restarted.waitForFunction(() => document.querySelectorAll('.model-card').length === 48);
+  const firstPage = await cards.first().getAttribute('aria-label');
+  await restarted.getByRole('button', { name: '次のページ', exact: true }).click();
+  assert.equal(await cards.count(), 48);
+  assert.notEqual(await cards.first().getAttribute('aria-label'), firstPage);
+  await cards.first().click();
+  assert.equal(await restarted.getByTestId('model-canvas').count(), 0);
+  assert.equal(await restarted.getByRole('button', { name: '3Dプレビューを読み込む', exact: true }).count(), 1);
+  findings.push('96 extra models are paginated at 48 mounted cards; selection does not create a WebGL canvas in lightweight mode');
   const report={passed:true,packaged,findings,errors,testDir};
   await fs.writeFile(path.join(out,packaged?'packaged-result.json':'smoke-result.json'),JSON.stringify(report,null,2));
   console.log(JSON.stringify(report,null,2));

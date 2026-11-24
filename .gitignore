@@ -21,4 +21,6 @@ public/occt/occt-import-js.wasm
 credentials.json
 secrets.json
 library.json
+library.sqlite3
+library.sqlite3-*
 thumbnail-batch.json

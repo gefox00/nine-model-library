@@ -17,6 +17,8 @@ const outputs = ['current', 'specified', 'selected', 'all'].map(name => path.joi
 await Promise.all([data, models, ...outputs].map(directory => fs.mkdir(directory)));
 const original = await fs.readFile(path.join(root, 'tests/fixtures/customizable-parts.scad'));
 const source = path.join(models, 'customizable-parts.scad');
+const presetJson = path.join(temp, 'customizable-parts.json');
+const importJson = path.join(temp, 'additional-presets.json');
 await fs.writeFile(source, original);
 const env = { ...process.env, NINE_DATA_DIR: data, NINE_TEST_MODE: '1' };
 for (const key of ['ELECTRON_RUN_AS_NODE', 'NODE_OPTIONS', 'VITE_DEV_SERVER_URL']) delete env[key];
@@ -45,12 +47,17 @@ try {
   const page = await app.firstWindow();
   assert.equal(await app.evaluate(({ app }) => app.getVersion()), JSON.parse(await fs.readFile(path.join(root, 'package.json'), 'utf8')).version, exe);
   await page.waitForFunction(() => window.nine?.getScadParameters);
-  await app.evaluate(({ dialog }, folders) => {
+  await app.evaluate(({ dialog }, { folders, presetJson, importJson }) => {
     dialog.showOpenDialog = async (_window, options) => {
+      if (options.title === 'OpenSCADプリセットJSONを読み込む') return { canceled: false, filePaths: [importJson] };
       if (!options.properties.includes('openDirectory') || !folders.length) throw new Error('Unexpected folder dialog');
       return { canceled: false, filePaths: [folders.shift()] };
     };
-  }, outputs);
+    dialog.showSaveDialog = async (_window, options) => {
+      if (options.title !== 'OpenSCADプリセットJSONの保存先') throw new Error('Unexpected save dialog');
+      return { canceled: false, filePath: presetJson };
+    };
+  }, { folders: outputs, presetJson, importJson });
   const state = await page.evaluate(directory => window.nine.importPaths([directory]), models);
   assert(state.settings.openscadPath, 'Smoke test requires an installed OpenSCAD executable');
   assert.equal(state.items.find(item => item.name === 'customizable-parts.scad')?.format, 'scad');
@@ -60,6 +67,7 @@ try {
   await page.locator('[data-testid="thumbnail-batch"][data-status="completed"]').waitFor({ timeout: 30000 });
   assert.equal((await page.evaluate(() => window.nine.getThumbnailBatch())).succeeded, 1);
   await card.click();
+  await page.getByRole('button', { name: '3Dプレビューを読み込む', exact: true }).click();
   await page.locator('[data-phase="ready"]').waitFor({ timeout: 30000 });
   const panel = page.getByTestId('scad-panel');
   const width = panel.getByRole('textbox', { name: /base.width/i });
@@ -70,6 +78,32 @@ try {
   assert.equal((await dimensions())[0], '20.00');
 
   await width.fill('26');
+  const savedPreset = panel.getByLabel('保存したプリセット', { exact: true });
+  await panel.getByLabel('プリセット名', { exact: true }).fill('Fixture Wide');
+  await panel.getByRole('button', { name: '新規保存', exact: true }).click();
+  await panel.getByText('プリセットを保存しました', { exact: true }).waitFor();
+  assert.equal(await savedPreset.locator('option:checked').textContent(), 'Fixture Wide');
+  await width.fill('30');
+  await panel.getByRole('button', { name: '適用', exact: true }).click();
+  await panel.getByText(/編集欄に反映しました/).waitFor();
+  assert.equal(await width.inputValue(), '26');
+  assert.equal((await dimensions())[0], '20.00', 'Applying a preset must not start a render');
+
+  await panel.getByRole('button', { name: 'JSONに書き出す', exact: true }).click();
+  await panel.getByText('プリセットをJSONに書き出しました', { exact: true }).waitFor();
+  const exportedPreset = JSON.parse(await fs.readFile(presetJson, 'utf8'));
+  assert.deepEqual(exportedPreset, { parameterSets: { 'Fixture Wide': { base_width: '26' } }, fileFormatVersion: '1' });
+  await fs.writeFile(importJson, JSON.stringify({ parameterSets: { Reimported: { base_width: '28' } }, fileFormatVersion: '1' }));
+  await panel.getByRole('button', { name: 'JSONを読み込む', exact: true }).click();
+  await panel.getByText('1件のプリセットを追加しました', { exact: true }).waitFor();
+  await savedPreset.selectOption({ label: 'Reimported' });
+  await panel.getByRole('button', { name: '適用', exact: true }).click();
+  await panel.getByText(/編集欄に反映しました/).waitFor();
+  assert.equal(await width.inputValue(), '28');
+  await savedPreset.selectOption({ label: 'Fixture Wide' });
+  await panel.getByRole('button', { name: '適用', exact: true }).click();
+  await panel.getByText(/編集欄に反映しました/).waitFor();
+  assert.equal(await width.inputValue(), '26');
   await panel.getByRole('button', { name: 'プレビューを更新' }).click();
   await page.waitForFunction(() => document.querySelector('.dimensions b')?.textContent === '26.00', null, { timeout: 30000 });
   await page.screenshot({ path: path.join(out, 'openscad-preview.png') });
@@ -107,7 +141,7 @@ try {
   assert.deepEqual(await fs.readFile(source), original);
   await info.scrollIntoViewIfNeeded();
   await page.screenshot({ path: path.join(out, 'openscad-export.png') });
-  console.log(JSON.stringify({ passed: true, packaged, previewWidth: 26, thumbnail: true, current: full.size, specified: specified.size, selected: selected.size, all: all.size, originalPreserved: true }));
+  console.log(JSON.stringify({ passed: true, packaged, previewWidth: 26, thumbnail: true, presets: 2, jsonRoundTrip: true, current: full.size, specified: specified.size, selected: selected.size, all: all.size, originalPreserved: true }));
 } finally {
   await app.close();
 }

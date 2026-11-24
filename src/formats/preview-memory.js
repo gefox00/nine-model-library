@@ -8,6 +8,10 @@ export function normalizeMemoryBudget(value) {
     ? value : config.defaultBudgetMiB;
 }
 
+export function effectivePreviewBudget(settings = {}) {
+  return settings.lightweightPreview === false ? normalizeMemoryBudget(settings.memoryBudgetMiB) : config.lightweightBudgetMiB;
+}
+
 // Same policy as the Electron reader: data format and multipliers live in the shared JSON.
 export function resolvePreviewLimits(value = config.defaultBudgetMiB) {
   const scale = normalizeMemoryBudget(value) / config.defaultBudgetMiB;

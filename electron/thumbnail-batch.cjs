@@ -78,7 +78,7 @@ class ThumbnailBatch extends EventEmitter {
     // Do not retain large thumbnails or item metadata in the queue or report.
     const snapshot = items.map(item => ({ id: item.id, name: item.name, path: item.path,
       size: item.size, modifiedAt: item.modifiedAt, format: item.format,
-      missing: Boolean(item.missing), hasThumbnail: Boolean(item.thumbnail) }));
+      missing: Boolean(item.missing), hasThumbnail: Boolean(item.hasThumbnail ?? item.thumbnail) }));
     const targets = snapshot.filter(item => !item.missing && (overwrite || scope === 'single' || !item.hasThumbnail));
     const skipped = snapshot.length - targets.length;
     this.cancelRequested = false;

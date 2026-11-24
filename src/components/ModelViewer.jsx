@@ -105,6 +105,7 @@ export default function ModelViewer({
   viewPreset = 'iso',
   fitToken = 0,
   memoryBudgetMiB = 2048,
+  lightweightPreview = true,
   reloadToken = 0,
   onOpenMemorySettings,
   scadValues,
@@ -130,18 +131,17 @@ export default function ModelViewer({
     if (!host) return;
     let renderer;
     try {
-      renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false, preserveDrawingBuffer: true });
+      renderer = new THREE.WebGLRenderer({ antialias: !lightweightPreview, alpha: false, powerPreference: lightweightPreview ? 'low-power' : 'default' });
     } catch (cause) {
       setError(`3D表示を初期化できませんでした。${cause.message}`);
       setPhase('error');
       return;
     }
-    renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
     renderer.setClearColor(BACKGROUND);
     renderer.outputColorSpace = THREE.SRGBColorSpace;
     renderer.toneMapping = THREE.ACESFilmicToneMapping;
     renderer.toneMappingExposure = 1.15;
-    renderer.shadowMap.enabled = true;
+    renderer.shadowMap.enabled = !lightweightPreview;
     renderer.shadowMap.type = THREE.PCFSoftShadowMap;
     renderer.domElement.setAttribute('aria-label', '3Dモデル。左ドラッグで回転、右ドラッグで移動、ホイールで拡大縮小');
     renderer.domElement.setAttribute('role', 'img');
@@ -153,14 +153,14 @@ export default function ModelViewer({
     camera.up.set(0, 0, 1);
     camera.position.set(100, -140, 100);
     const controls = new OrbitControls(camera, renderer.domElement);
-    controls.enableDamping = true;
+    controls.enableDamping = !lightweightPreview;
     controls.dampingFactor = 0.085;
     controls.autoRotateSpeed = 1.1;
     controls.screenSpacePanning = true;
     const ambient = new THREE.HemisphereLight(0xe9f5ff, 0x52647b, 2.5);
     ambient.position.set(0, 0, 1);
     const keyLight = new THREE.DirectionalLight(0xffffff, 3.3);
-    keyLight.castShadow = true;
+    keyLight.castShadow = !lightweightPreview;
     keyLight.shadow.mapSize.set(2048, 2048);
     keyLight.shadow.bias = -0.0001;
     const fillLight = new THREE.DirectionalLight(0x8bbcf6, 1.5);
@@ -168,16 +168,26 @@ export default function ModelViewer({
     scene.add(ambient, keyLight, keyLight.target, fillLight);
 
     let active = true;
-    let frame = 0;
-    let dirtyFrames = 2;
+    let frame = null;
+    const invalidate = () => {
+      if (active && frame === null && !document.hidden) frame = requestAnimationFrame(render);
+    };
+    function render() {
+      frame = null;
+      if (!active || document.hidden) return;
+      controls.autoRotate = optionsRef.current.autoRotate && Boolean(engine.model);
+      controls.update();
+      renderer.render(scene, camera);
+      if (controls.autoRotate) invalidate();
+    }
     const engine = {
       renderer, scene, camera, controls, keyLight,
       model: null, ground: null, dimensions: null, center: new THREE.Vector3(),
       showGrid: optionsRef.current.showGrid,
-      invalidate: () => { dirtyFrames = 80; },
+      invalidate,
     };
     engineRef.current = engine;
-    const onChange = () => { dirtyFrames = Math.max(dirtyFrames, 2); };
+    const onChange = invalidate;
     controls.addEventListener('change', onChange);
     const onStart = () => engine.invalidate();
     controls.addEventListener('start', onStart);
@@ -189,6 +199,7 @@ export default function ModelViewer({
       if (lastWidth === width && lastHeight === height) return;
       lastWidth = width;
       lastHeight = height;
+      renderer.setPixelRatio(lightweightPreview ? Math.min(1, 1280 / width, 900 / height) : Math.min(window.devicePixelRatio || 1, 2));
       renderer.setSize(width, height);
       camera.aspect = width / height;
       camera.updateProjectionMatrix();
@@ -197,22 +208,11 @@ export default function ModelViewer({
     const observer = new ResizeObserver(resize);
     observer.observe(host);
     resize();
-    const render = () => {
-      if (!active) return;
-      frame = requestAnimationFrame(render);
-      controls.autoRotate = optionsRef.current.autoRotate && !!engine.model;
-      if (!document.hidden && (dirtyFrames > 0 || controls.autoRotate)) {
-        controls.update();
-        renderer.render(scene, camera);
-        dirtyFrames--;
-      }
-    };
-    render();
     const onVisibility = () => engine.invalidate();
     document.addEventListener('visibilitychange', onVisibility);
     return () => {
       active = false;
-      cancelAnimationFrame(frame);
+      if (frame !== null) cancelAnimationFrame(frame);
       observer.disconnect();
       document.removeEventListener('visibilitychange', onVisibility);
       controls.removeEventListener('change', onChange);
@@ -224,7 +224,7 @@ export default function ModelViewer({
       renderer.domElement.remove();
       if (engineRef.current === engine) engineRef.current = null;
     };
-  }, []);
+  }, [lightweightPreview]);
 
   useEffect(() => {
     const engine = engineRef.current;
@@ -263,14 +263,16 @@ export default function ModelViewer({
     const isScad = item.format === 'scad';
     const overrides = optionsRef.current.scadValues || {};
     let scadRequestId;
+    let modelRequestId;
     (async () => {
       let loadedObject;
       try {
         if (isScad && !scadExecutable) throw new Error('設定からOpenSCADの実行ファイルを指定してください。');
         const input = isScad
           ? await window.nine.renderScad(item.id, overrides, (scadRequestId = crypto.randomUUID()))
-          : { bytes: await window.nine.readModel(item.id, { memoryBudgetMiB: loadBudgetMiB }) };
+          : { bytes: await window.nine.readModel(item.id, { memoryBudgetMiB: loadBudgetMiB }, (modelRequestId = crypto.randomUUID())) };
         scadRequestId = undefined;
+        modelRequestId = undefined;
         if (cancelled) return;
         const filename = isScad ? `${item.name}.stl` : item.name;
         const result = await loadModel(input.bytes, { filename, signal: controller.signal, memoryBudgetMiB: loadBudgetMiB });
@@ -284,12 +286,14 @@ export default function ModelViewer({
           setPreviewImage(result.previewImage);
           setPhase('preview');
           callbacksRef.current.onMetadata?.({ ...result.metadata, warnings: result.warnings, unit: 'mm' });
+          if (item.hasThumbnail) return;
           const image = new Image();
           image.onload = () => {
             if (cancelled) return;
             const canvas = document.createElement('canvas');
             canvas.width = 360; canvas.height = 260;
             const context = canvas.getContext('2d');
+            if (!context) return;
             const scale = Math.min(360 / image.width, 260 / image.height);
             context.fillStyle = BACKGROUND; context.fillRect(0, 0, 360, 260);
             context.drawImage(image, (360-image.width*scale)/2, (260-image.height*scale)/2, image.width*scale, image.height*scale);
@@ -333,14 +337,16 @@ export default function ModelViewer({
           warnings: result.warnings || [],
           unit: result.unit || 'mm',
         });
-        // Capture on the same frame as the render, so the image works without a second GPU context.
+        // Existing thumbnails stay untouched on ordinary previews.
+        if (item.hasThumbnail || (isScad && Object.keys(overrides).length)) return;
+        // Capture immediately after rendering, without retaining the drawing buffer.
         engine.renderer.render(engine.scene, engine.camera);
         const canvas = document.createElement('canvas');
         canvas.width = 360;
         canvas.height = 260;
         const context = canvas.getContext('2d');
         const source = engine.renderer.domElement;
-        if (context && source.width && source.height && (!isScad || !Object.keys(overrides).length)) {
+        if (context && source.width && source.height) {
           const scale = Math.min(canvas.width / source.width, canvas.height / source.height);
           const width = source.width * scale;
           const height = source.height * scale;
@@ -360,8 +366,9 @@ export default function ModelViewer({
       cancelled = true;
       controller.abort();
       if (scadRequestId) window.nine.cancelScadRender(scadRequestId).catch(() => {});
+      if (modelRequestId) window.nine.cancelModelRead(modelRequestId).catch(() => {});
     };
-  }, [item?.id, item?.modifiedAt, item?.missing, reloadToken, retryToken, scadExecutable]);
+  }, [item?.id, item?.modifiedAt, item?.missing, reloadToken, retryToken, scadExecutable, lightweightPreview]);
 
   useEffect(() => {
     const engine = engineRef.current;

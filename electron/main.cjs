@@ -1,17 +1,21 @@
 const { app, BrowserWindow, ipcMain, dialog, shell } = require('electron');
 const path = require('node:path');
 const fs = require('node:fs/promises');
-const { spawn } = require('node:child_process');
 const { Library } = require('./library.cjs');
+const { BambuPrint } = require('./bambu-print.cjs');
 const { ThumbnailBatch, abortError } = require('./thumbnail-batch.cjs');
 const scad = require('./scad-engine.cjs');
+const { ScadPresets, readCustomizerJson, writeCustomizerJson } = require('./scad-presets.cjs');
 const formats = require('../shared/formats.json');
+const { assertMemoryBudget, effectivePreviewBudget } = require('../shared/preview-memory.cjs');
 
 app.setName('Nine Model Library');
 let library;
 let mainWindow;
 let thumbnailBatch;
+let bambuPrint;
 let activeThumbnailWorker = null;
+let activeModelRead = null;
 const scadRenders = new Map();
 let scadExport = null;
 let quitting = false;
@@ -38,29 +42,45 @@ function handle(name, callback) {
 
 async function boot() {
   library = new Library(app.getPath('userData'));
-  await library.init();
+  await library.init({ backgroundScan: true });
+  bambuPrint = new BambuPrint({
+    getExecutable: () => library.data.settings.bambuPath,
+    getOpenScad: () => library.data.settings.openscadPath,
+    getItem: id => library.item(id),
+    captureSource: id => library.captureFileSource(id),
+    validateSource: (id, source) => library.assertThumbnailSource(id, source, '印刷準備'),
+    renderScad: scad.writeScadPrintStl,
+    stagingRoot: path.join(app.getPath('temp'), 'nine-model-library-print'),
+  });
+  registerScadPresetIpc(new ScadPresets(library.database));
   library.on('state', state => {
     if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('nine:state', state);
   });
   const batchReportFile = path.join(app.getPath('userData'), 'thumbnail-batch.json');
+  library.database.exec(`CREATE TABLE IF NOT EXISTS thumbnail_batch_report (
+    id INTEGER PRIMARY KEY CHECK (id = 1), report_json TEXT NOT NULL
+  ) STRICT`);
+  const readBatchReport = library.database.prepare('SELECT report_json FROM thumbnail_batch_report WHERE id = 1');
+  const saveBatchReport = library.database.prepare(`INSERT INTO thumbnail_batch_report (id, report_json) VALUES (1, ?)
+    ON CONFLICT (id) DO UPDATE SET report_json = excluded.report_json`);
   thumbnailBatch = new ThumbnailBatch({
     generate: generateThumbnail,
     saveThumbnail: (item, result, { signal }) => library.saveThumbnail(item.id, result.dataUrl, item, { signal }),
-    persistReport: async report => {
-      const temporary = `${batchReportFile}.${process.pid}.tmp`;
-      await fs.writeFile(temporary, JSON.stringify(report, null, 2), 'utf8');
-      await fs.rename(temporary, batchReportFile);
-    },
+    persistReport: async report => { saveBatchReport.run(JSON.stringify(report)); },
   });
   thumbnailBatch.on('state', state => {
     if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('nine:thumbnail-batch', state);
   });
-  try { await thumbnailBatch.restore(JSON.parse(await fs.readFile(batchReportFile, 'utf8'))); }
+  try {
+    const saved = readBatchReport.get()?.report_json ?? await fs.readFile(batchReportFile, 'utf8');
+    await thumbnailBatch.restore(JSON.parse(saved));
+  }
   catch (error) {
     if (error.code !== 'ENOENT') thumbnailBatch.state.reportError = `前回の生成結果を読み込めません: ${error.message}`;
   }
   registerThumbnailWorkerIpc();
   handle('getState', () => library.getState());
+  handle('getThumbnail', (id, revision) => library.readThumbnail(id, revision));
   handle('addFiles', async () => {
     const result = await dialog.showOpenDialog(mainWindow, { title: '3Dファイルを登録', properties: ['openFile', 'multiSelections'], filters: [
       { name: '3Dモデル', extensions: formats.flatMap(format => format.extensions) },
@@ -95,7 +115,34 @@ async function boot() {
     if (result.response !== 1) return null;
     return library.trashModel(id, source, file => shell.trashItem(file));
   });
-  handle('readModel', (id, options) => library.readModel(id, options));
+  handle('readModel', (id, options = {}, requestId) => {
+    if (!options || typeof options !== 'object' || Array.isArray(options) ||
+        Object.keys(options).some(key => key !== 'memoryBudgetMiB')) throw new Error('読み込み設定が不正です');
+    if (requestId !== undefined) validateScadRequestId(requestId);
+    if (library.data.settings.lightweightPreview && (thumbnailBatch.isRunning() || bambuPrint.isPreparing())) {
+      throw new Error('サムネイル生成または印刷準備が終わってからプレビューしてください');
+    }
+    const configured = effectivePreviewBudget(library.data.settings);
+    const budget = options.memoryBudgetMiB === undefined ? configured : Math.min(configured, assertMemoryBudget(options.memoryBudgetMiB));
+    const previous = activeModelRead;
+    previous?.controller.abort(abortError('別のモデルを選択しました'));
+    const operation = { requestId, controller: new AbortController(), promise: null };
+    activeModelRead = operation;
+    operation.promise = (async () => {
+      try {
+        await previous?.promise.catch(() => {});
+        operation.controller.signal.throwIfAborted();
+        return await library.readModel(id, { memoryBudgetMiB: budget, signal: operation.controller.signal });
+      } finally { if (activeModelRead === operation) activeModelRead = null; }
+    })();
+    return operation.promise;
+  });
+  handle('cancelModelRead', requestId => {
+    validateScadRequestId(requestId);
+    if (!activeModelRead || activeModelRead.requestId !== requestId) return false;
+    activeModelRead.controller.abort(abortError('読み込みを中止しました'));
+    return true;
+  });
   handle('updateSettings', patch => library.updateSettings(patch));
   handle('chooseOpenScad', async () => {
     const result = await dialog.showOpenDialog(mainWindow, {
@@ -114,6 +161,9 @@ async function boot() {
   });
   handle('renderScad', async (id, values, requestId) => {
     requireScadItem(id);
+    if (library.data.settings.lightweightPreview && (thumbnailBatch.isRunning() || bambuPrint.isPreparing())) {
+      throw new Error('サムネイル生成または印刷準備が終わってからプレビューしてください');
+    }
     validateScadRequestId(requestId);
     if (scadRenders.has(requestId)) throw new Error('同じOpenSCAD要求がすでに実行中です');
     if (scadRenders.size >= 8) throw new Error('OpenSCADの待機中要求が多すぎます。前の処理を中止してください');
@@ -122,7 +172,7 @@ async function boot() {
     try {
       const source = await library.captureFileSource(id);
       const result = await scad.renderScad({ executable: library.data.settings.openscadPath,
-        sourcePath: source.path, values: values ?? {}, memoryBudgetMiB: library.data.settings.memoryBudgetMiB, signal: controller.signal });
+        sourcePath: source.path, values: values ?? {}, memoryBudgetMiB: effectivePreviewBudget(library.data.settings), signal: controller.signal });
       controller.signal.throwIfAborted();
       await library.assertThumbnailSource(id, source, 'プレビュー生成');
       return result;
@@ -163,16 +213,19 @@ async function boot() {
   handle('generateThumbnail', async id => {
     const item = library.item(id);
     if (thumbnailBatch.isRunning()) throw new Error('サムネイル生成はすでに実行中です');
+    if (library.data.settings.lightweightPreview && bambuPrint.isPreparing()) throw new Error('印刷準備が終わってからサムネイルを生成してください');
     if (item.missing) throw new Error('元ファイルが見つからないため、サムネイルを生成できません');
     const stat = await fs.stat(item.path).catch(() => { throw new Error('元ファイルが見つからないか、読み取れないため、サムネイルを生成できません'); });
     if (!stat.isFile()) throw new Error('対象がファイルではないため、サムネイルを生成できません');
     if (library.item(id) !== item) throw new Error('ライブラリの登録が変更されました。ファイルを選び直してください');
-    return thumbnailBatch.start({ items: [item], memoryBudgetMiB: library.data.settings.memoryBudgetMiB, overwrite: true, scope: 'single' });
+    if (library.data.settings.lightweightPreview && bambuPrint.isPreparing()) throw new Error('印刷準備が終わってからサムネイルを生成してください');
+    return thumbnailBatch.start({ items: [item], memoryBudgetMiB: effectivePreviewBudget(library.data.settings), overwrite: true, scope: 'single' });
   });
   handle('startThumbnailBatch', options => {
     if (!options || typeof options !== 'object' || Array.isArray(options) || Object.keys(options).some(key => key !== 'overwrite') ||
         (options.overwrite !== undefined && typeof options.overwrite !== 'boolean')) throw new Error('サムネイル生成の指定が不正です');
-    return thumbnailBatch.start({ items: library.data.items, memoryBudgetMiB: library.data.settings.memoryBudgetMiB, overwrite: options.overwrite ?? false });
+    if (library.data.settings.lightweightPreview && bambuPrint.isPreparing()) throw new Error('印刷準備が終わってからサムネイルを生成してください');
+    return thumbnailBatch.start({ items: library.data.items, memoryBudgetMiB: effectivePreviewBudget(library.data.settings), overwrite: options.overwrite ?? false });
   });
   handle('stopThumbnailBatch', () => thumbnailBatch.stop());
   handle('importPaths', paths => library.importPaths(paths));
@@ -185,22 +238,20 @@ async function boot() {
       properties: ['openFile'],
       filters: [{ name: '実行ファイル', extensions: ['exe'] }],
     });
-    return result.canceled ? library.getState() : library.setBambu(result.filePaths[0]);
+    if (result.canceled || !result.filePaths.length) return library.getState();
+    await bambuPrint.requireExecutable(result.filePaths[0]);
+    return library.setBambu(result.filePaths[0]);
   });
-  handle('openBambu', async id => {
-    const item = library.item(id);
-    if (item.format === 'scad') throw new Error('OpenSCADソースはBambu Studioで開けません。STLに書き出してから開いてください');
-    const executable = library.data.settings.bambuPath;
-    if (!executable) throw new Error('設定でBambu Studioの実行ファイルを選んでください');
-    await fs.access(executable).catch(() => { throw new Error('Bambu Studioが見つかりません。設定で実行ファイルを選び直してください'); });
-    await fs.access(item.path).catch(() => { throw new Error('元の3Dファイルが見つかりません'); });
-    // Keep the original project, including Bambu print profiles and plate settings.
-    return new Promise((resolve, reject) => {
-      const child = spawn(executable, [item.path], { detached: true, stdio: 'ignore', shell: false });
-      child.once('error', error => reject(new Error(`Bambu Studioを開けません: ${error.message}`)));
-      child.once('spawn', () => { child.unref(); resolve({ opened: true }); });
-    });
-  });
+  handle('getBambuPrintStatus', () => bambuPrint.getStatus());
+  const prepareBambuPrint = (id, values) => {
+    if (library.data.settings.lightweightPreview && thumbnailBatch.isRunning()) {
+      throw new Error('サムネイル生成が終わってから印刷準備を開始してください');
+    }
+    return bambuPrint.prepare(id, values);
+  };
+  handle('prepareBambuPrint', prepareBambuPrint);
+  handle('cancelBambuPrintPreparation', () => bambuPrint.cancel());
+  handle('openBambu', id => prepareBambuPrint(id));
   createWindow();
   app.on('activate', () => { if (!BrowserWindow.getAllWindows().length) createWindow(); });
 }
@@ -209,6 +260,77 @@ function requireScadItem(id) {
   const item = library.item(id);
   if (item.format !== 'scad' || path.extname(item.path).toLowerCase() !== '.scad') throw new Error('OpenSCADファイルを選んでください');
   return item;
+}
+
+function registerScadPresetIpc(presets) {
+  async function currentParameters(id, action) {
+    requireScadItem(id);
+    const source = await library.captureFileSource(id);
+    const { parameters } = await scad.readScadParameters(source.path);
+    if (!parameters.length) throw new Error('現在のSCADにはプリセットに使える公開パラメータがありません');
+    await library.assertThumbnailSource(id, source, action);
+    return { parameters, source };
+  }
+
+  handle('listScadPresets', id => {
+    requireScadItem(id);
+    return presets.list(id);
+  });
+  handle('saveScadPreset', async (id, presetId, name, values) => {
+    const { parameters, source } = await currentParameters(id, 'プリセット保存');
+    return library.enqueue(async () => {
+      await library.assertThumbnailSource(id, source, 'プリセット保存');
+      const savedId = presets.save(id, presetId, name, values, parameters);
+      return { id: savedId, presets: presets.list(id) };
+    });
+  });
+  handle('applyScadPreset', async (id, presetId) => {
+    const { parameters } = await currentParameters(id, 'プリセット適用');
+    return { values: presets.apply(id, presetId, parameters) };
+  });
+  handle('removeScadPreset', async (id, presetId) => {
+    requireScadItem(id);
+    const preset = presets.get(id, presetId);
+    const result = await dialog.showMessageBox(mainWindow, {
+      type: 'warning', title: 'プリセットを削除', message: `「${preset.name}」を削除しますか？`,
+      buttons: ['キャンセル', '削除'], defaultId: 0, cancelId: 0, noLink: true,
+    });
+    if (result.response !== 1) return null;
+    return library.enqueue(() => {
+      requireScadItem(id);
+      presets.remove(id, preset);
+      return { presets: presets.list(id) };
+    });
+  });
+  handle('exportScadPresets', async id => {
+    const item = requireScadItem(id);
+    const json = presets.toCustomizerJson(id);
+    const base = path.basename(item.name, path.extname(item.name));
+    const choice = await dialog.showSaveDialog(mainWindow, { title: 'OpenSCADプリセットJSONの保存先',
+      defaultPath: `${base}.json`, filters: [{ name: 'OpenSCAD Customizer JSON', extensions: ['json'] }] });
+    if (choice.canceled || !choice.filePath) return null;
+    const destination = path.extname(choice.filePath) ? choice.filePath : `${choice.filePath}.json`;
+    if (path.extname(destination).toLowerCase() !== '.json') throw new Error('保存先の拡張子は.jsonにしてください');
+    try { await writeCustomizerJson(destination, json); }
+    catch (error) {
+      if (error.code === 'EEXIST') throw new Error('同じ名前のJSONがすでにあります。別の名前で保存してください');
+      throw new Error('プリセットJSONを保存できません。保存先の権限と空き容量を確認してください');
+    }
+    return { saved: true };
+  });
+  handle('importScadPresets', async id => {
+    requireScadItem(id);
+    const choice = await dialog.showOpenDialog(mainWindow, { title: 'OpenSCADプリセットJSONを読み込む',
+      properties: ['openFile'], filters: [{ name: 'OpenSCAD Customizer JSON', extensions: ['json'] }] });
+    if (choice.canceled || !choice.filePaths.length) return null;
+    const json = await readCustomizerJson(choice.filePaths[0]);
+    const { parameters, source } = await currentParameters(id, 'プリセット読み込み');
+    return library.enqueue(async () => {
+      await library.assertThumbnailSource(id, source, 'プリセット読み込み');
+      const count = presets.fromCustomizerJson(id, json, parameters);
+      return { count, presets: presets.list(id) };
+    });
+  });
 }
 
 function validateScadRequestId(requestId) {
@@ -320,8 +442,12 @@ app.on('window-all-closed', () => { if (process.platform !== 'darwin') app.quit(
 app.on('before-quit', event => {
   if (library && !quitting) {
     event.preventDefault(); quitting = true;
+    const pendingRead = activeModelRead;
+    pendingRead?.controller.abort(abortError('アプリを終了しています'));
     for (const controller of scadRenders.values()) controller.abort(abortError('アプリを終了しています'));
     scadExport?.abort(abortError('アプリを終了しています'));
-    Promise.resolve(thumbnailBatch?.close()).then(() => scad.waitForScadIdle()).then(() => library.close()).finally(() => app.quit());
+    bambuPrint?.cancel();
+    Promise.allSettled([pendingRead?.promise, thumbnailBatch?.close(), bambuPrint?.waitForIdle(), scad.waitForScadIdle()])
+      .then(() => library.close()).catch(error => console.error('Library close failed:', error.message)).finally(() => app.quit());
   }
 });

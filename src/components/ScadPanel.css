@@ -12,6 +12,17 @@
 .scad-callout p{font-size:10px;line-height:1.7}
 .scad-callout button{display:flex;align-items:center;gap:6px;color:var(--accent,#c6ef8a);font-size:10px;margin-top:9px;padding:0}
 .scad-loading{display:flex;align-items:center;justify-content:center;gap:8px;padding:26px 13px;color:#8b9db4;font-size:10px}
+.scad-presets{padding:12px 16px;border-bottom:1px solid var(--line,#28313d)}
+.scad-presets>summary{cursor:pointer;color:#c6d3df;font-weight:600}
+.scad-presets>summary>span{float:right;color:#8398ae;font-weight:400}
+.scad-preset-fields{display:flex;flex-direction:column;gap:6px;padding-top:10px;min-width:0}
+.scad-preset-fields>label{color:#9db0c5;font-size:10px}
+.scad-preset-fields>select,.scad-preset-fields>input{width:100%;height:31px;min-width:0;padding:5px 8px;font-size:11px;color:#dbe5ee;background:#111821;border:1px solid #2e3a4b;border-radius:5px}
+.scad-preset-buttons{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:5px;margin:3px 0}
+.scad-preset-buttons>button{padding:5px 4px;min-width:0;min-height:30px;justify-content:center;gap:3px;font-size:10px;white-space:normal}
+.scad-preset-buttons>button>svg{flex-shrink:0}
+.scad-preset-fields>.scad-subtle{margin-top:0}
+.scad-preset-notice{font-size:10px;color:var(--accent,#c6ef8a);line-height:1.65}
 .scad-empty{padding:14px 16px;color:#8090a7;font-size:10px;line-height:1.8}
 .scad-group{border-bottom:1px solid var(--line,#28313d)}
 .scad-group>summary{display:flex;align-items:center;gap:7px;padding:12px 16px;font-size:11px;font-weight:600;color:#a3b1c2;cursor:pointer;list-style:none;overflow-wrap:anywhere}

@@ -7,7 +7,9 @@ import { fileURLToPath } from 'node:url';
 
 const root = fileURLToPath(new URL('../', import.meta.url));
 const packaged = process.argv.includes('--packaged');
-const executablePath = path.join(root, packaged ? 'release/win-unpacked/Nine Model Library.exe' : 'node_modules/electron/dist/electron.exe');
+const releaseDirectory = process.argv.find(arg => arg.startsWith('--release-dir='))?.slice('--release-dir='.length) || 'release';
+const executablePath = packaged ? path.resolve(root, releaseDirectory, 'win-unpacked/Nine Model Library.exe')
+  : path.join(root, 'node_modules/electron/dist/electron.exe');
 const args = packaged ? [] : ['.'];
 const out = path.join(root,'output/playwright');
 await fs.mkdir(out,{recursive:true});
@@ -47,6 +49,8 @@ try {
   await waitForMemoryBudget(page, 512);
   await page.getByRole('button',{name:'設定を閉じる',exact:true}).click();
   await page.getByRole('button',{name:'モデル memory-limit-cube.3mf',exact:true}).click();
+  assert.equal(await page.getByTestId('model-viewer').count(), 0);
+  await page.getByRole('button', { name: '3Dプレビューを読み込む', exact: true }).click();
   await page.locator('[data-phase="error"]').waitFor({timeout:30000});
   assert.match(await page.locator('[role="alert"]').innerText(),/32 MiB/);
   assert.match(await page.locator('[role="alert"]').innerText(),/プレビューメモリ/);
@@ -59,6 +63,7 @@ try {
   assert.equal(await page.locator('[data-testid="model-viewer"]').getAttribute('data-phase'),'error');
   findings.push('Saving only preserves current model and does not trigger an unexpected reload');
   await page.screenshot({path:path.join(out,'memory-settings.png')});
+  await page.getByRole('checkbox', { name: '軽量モード（標準）' }).uncheck();
   await page.getByRole('button',{name:'保存して再読み込み',exact:true}).click();
   await page.locator('[data-phase="ready"]').waitFor({timeout:30000});
   assert.deepEqual(await page.locator('.dimensions b').allTextContents(),['20.00','30.00','10.00']);

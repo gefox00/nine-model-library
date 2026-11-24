@@ -26,10 +26,10 @@ Keep changes focused on the requested behavior and preserve existing library dat
   Node integration disabled. Every privileged main-window IPC call must pass
   the sender and main-frame guard in `electron/main.cjs`. Thumbnail-worker IPC
   must accept only the currently assigned worker and its main frame.
-- Serialize library mutations through `Library.enqueue()` and persist with
-  same-directory temporary-file replacement. A schema migration must preserve
-  unrelated settings, tags, notes, favorites, and exclusions. Never replace a
-  corrupt library with an empty one as an automatic recovery shortcut.
+- Serialize library mutations through `Library.enqueue()`. Commit SQLite row
+  changes before updating the in-memory catalog. A schema migration must preserve
+  settings, tags, notes, favorites, and exclusions, and retain the legacy JSON.
+  Never replace a corrupt library with an empty one or silently roll back to JSON.
 - Item IDs identify normalized file paths, not file contents. Registration does
   not relocate source files. Updating geometry invalidates its cached thumbnail.
   Removing a watch folder keeps its registered items.
@@ -41,8 +41,9 @@ Keep changes focused on the requested behavior and preserve existing library dat
   native confirmation with Cancel as the default, revalidates the captured source,
   and calls `shell.trashItem` with no permanent-delete fallback. Registration-only
   removal and moving the source to the Recycle Bin have different exclusion rules.
-- Bambu Studio receives the original file through `spawn(executable, [path],
-  { shell: false })`. Do not substitute a preview mesh for the original project.
+- Bambu Studio receives the original STL, STEP or 3MF through the verified GUI
+  executable without a shell. OpenSCAD uses a bounded temporary STL generated
+  from the current parameters. Confirm printer and send from Studio.
 - OpenSCAD runs as an external process with no shell and the original source
   directory as its working directory. Only validated Customizer literals may
   become parameter overrides. Keep previews in temporary files and never

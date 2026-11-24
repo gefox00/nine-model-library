@@ -1,5 +1,6 @@
 import { useEffect, useId, useMemo, useRef, useState } from 'react';
 import { AlertCircle, Check, Download, Loader2, Play, RotateCcw, Settings2, Square } from 'lucide-react';
+import ScadPresetControls from './ScadPresetControls.jsx';
 import './ScadPanel.css';
 
 const MODES = [
@@ -12,14 +13,19 @@ const hasOwn = (object, name) => Object.prototype.hasOwnProperty.call(object || 
 const displayValue = value => Array.isArray(value) ? `[${value.join(', ')}]` : String(value ?? '');
 const sameValue = (a, b) => Array.isArray(a) || Array.isArray(b) ? JSON.stringify(a) === JSON.stringify(b) : Object.is(a, b);
 
-function numericInput(text, parameter) {
+function numericInput(text, parameter, defaultValue = parameter.defaultValue) {
   const trimmed = String(text).trim();
   if (!trimmed) return { error: '数値を入力してください' };
   if (!/^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?$/.test(trimmed)) return { error: '有効な数値を入力してください' };
   const value = Number(trimmed);
   if (!Number.isFinite(value)) return { error: '有限の数値を入力してください' };
+  if (value === defaultValue) return { value };
   if (Number.isFinite(parameter.min) && value < parameter.min) return { error: `${parameter.min} 以上にしてください` };
   if (Number.isFinite(parameter.max) && value > parameter.max) return { error: `${parameter.max} 以下にしてください` };
+  if (Number.isFinite(parameter.step) && parameter.step > 0) {
+    const ticks = (value - (parameter.min ?? 0)) / parameter.step;
+    if (!Number.isFinite(ticks) || Math.abs(ticks - Math.round(ticks)) > 1e-7) return { error: `刻み ${parameter.step} に合わせてください` };
+  }
   return { value };
 }
 
@@ -35,14 +41,14 @@ function isViewOption(option) {
 
 function parameterError(parameter, current, draft) {
   if (parameter.options?.length) {
-    return parameter.options.some(option => sameValue(option.value, current)) ? null : '一覧から値を選択してください';
+    return sameValue(current, parameter.defaultValue) || parameter.options.some(option => sameValue(option.value, current)) ? null : '一覧から値を選択してください';
   }
   if (parameter.type === 'number') return numericInput(draft ?? current, parameter).error || null;
   if (parameter.type === 'vector') {
     const parts = draft ?? current;
     if (!Array.isArray(parts) || parts.length !== parameter.defaultValue?.length) return 'ベクトルの要素数が一致しません';
     for (let i = 0; i < parts.length; i++) {
-      const error = numericInput(parts[i], parameter).error;
+      const error = numericInput(parts[i], parameter, parameter.defaultValue[i]).error;
       if (error) return `${i + 1} 番目: ${error}`;
     }
   }
@@ -62,6 +68,7 @@ export default function ScadPanel({
   item,
   parametersInfo,
   values = {},
+  presets,
   onValuesChange,
   onReset,
   onPreview,
@@ -129,7 +136,7 @@ export default function ScadPanel({
     const next = [...current];
     next[index] = text;
     setDrafts(previous => ({ ...previous, [parameter.name]: next }));
-    const parsed = next.map(part => numericInput(part, parameter));
+    const parsed = next.map((part, partIndex) => numericInput(part, parameter, parameter.defaultValue[partIndex]));
     if (parsed.every(part => !part.error)) commit(parameter.name, parsed.map(part => part.value));
   }
   function reset() {
@@ -149,7 +156,7 @@ export default function ScadPanel({
     const accessibility = {
       'aria-invalid': Boolean(error),
       'aria-describedby': `${inputId}-help`,
-      disabled: isExporting,
+      disabled: isExporting || presets?.busy,
     };
     let control;
     if (parameter.options?.length) {
@@ -157,7 +164,7 @@ export default function ScadPanel({
       control = <select id={inputId} {...accessibility} value={String(index)} onChange={event => {
         const option = parameter.options[Number(event.target.value)];
         if (option) commit(parameter.name, option.value);
-      }}>{index < 0 && <option value="-1" disabled>値を選択</option>}{parameter.options.map((option, index) => <option key={index} value={index}>{option.label || displayValue(option.value)}</option>)}</select>;
+      }}>{index < 0 && <option value="-1" disabled>{sameValue(current, parameter.defaultValue) ? `既定値 (${displayValue(current)})` : '値を選択'}</option>}{parameter.options.map((option, index) => <option key={index} value={index}>{option.label || displayValue(option.value)}</option>)}</select>;
     } else if (parameter.type === 'boolean') {
       control = <label className="scad-boolean"><input id={inputId} {...accessibility} type="checkbox" checked={current === true} onChange={event => commit(parameter.name, event.target.checked)}/><span>{current === true ? 'オン' : 'オフ'}</span></label>;
     } else if (parameter.type === 'number') {
@@ -186,7 +193,7 @@ export default function ScadPanel({
       : mode === 'all' ? allOptions : [];
   const parts = chosenOptions.filter((option, index, all) => all.findIndex(candidate => sameValue(candidate.value, option.value)) === index).map(option => option.value);
   const invalidParts = mode !== 'current' && (!selector || parts.length === 0);
-  const actionsDisabled = loading || !canRender || errors.length > 0 || isExporting;
+  const actionsDisabled = loading || !canRender || errors.length > 0 || isExporting || presets?.busy;
   const exportDisabled = actionsDisabled || invalidParts || isPreviewing;
   const currentExport = typeof exportState?.current === 'string' ? exportState.current : exportState?.current?.name;
   const outputFiles = exportResult?.files || [];
@@ -197,6 +204,8 @@ export default function ScadPanel({
     <header className="scad-panel-heading"><div><span>OPENSCAD</span><h2>パラメータ</h2></div><div className="scad-panel-heading-actions"><button type="button" className="scad-export-jump" onClick={jumpToExport}><Download size={13}/>STL出力へ</button><button type="button" className="icon-button" title="パラメータを初期値に戻す" aria-label="パラメータを初期値に戻す" onClick={reset} disabled={loading || isExporting}><RotateCcw size={15}/></button></div></header>
     {!canRender && <div className="scad-callout"><AlertCircle size={15}/><div>{item?.missing ? <p>元ファイルが見つかりません。元の場所に戻すか、移動先から登録してください。</p> : <><p>プレビューとSTL出力にはOpenSCADの設定が必要です。</p><button type="button" onClick={onOpenSettings}><Settings2 size={13}/>OpenSCADを設定</button></>}</div></div>}
     <div className="scad-panel-scroll">
+      {presets && <ScadPresetControls key={item?.missing ? 'missing' : 'present'} presets={presets} canEdit={!item?.missing && parameters.length > 0}
+        canSave={errors.length === 0} disabled={isExporting} onApply={() => setDrafts({})}/>}
       {loading ? <div className="scad-loading" role="status"><Loader2 size={15} className="spin"/>パラメータを読み込み中</div> : parameters.length ? [...grouped.entries()].map(([group, fields]) => <details className="scad-group" open key={group}><summary>{group}<span>{fields.length}</span></summary><div className="scad-group-fields">{fields.map(renderField)}</div></details>) : <p className="scad-empty">公開パラメータはありません。現在のモデルをプレビュー・出力できます。</p>}
       {diagnostics.length > 0 && <details className="scad-diagnostics"><summary>読み取りについて <span>{diagnostics.length}</span></summary>{diagnostics.map((message, index) => <p key={index}>{typeof message === 'string' ? message : message?.message || String(message)}</p>)}</details>}
       <div className="scad-preview-actions">

@@ -14,7 +14,7 @@ React UI (src/App.jsx and components)
 electron/preload.cjs -> electron/main.cjs -> Library
                                           | serialized mutations
                                           v
-                                    library.json + watched files
+                                    library.sqlite3 + watched files
 
 ModelViewer -> loadModel -> STL / STEP / 3MF adapters -> Three.js
                                |
@@ -27,7 +27,7 @@ ThumbnailBatch -> one hidden BrowserWindow per item
     v
 destroy worker -> validate source -> save image -> advance
     |
-    +-> thumbnail-batch.json (progress and result only)
+    +-> SQLite thumbnail_batch_report (progress and result only)
 ```
 
 `main.cjs` creates the normal window and handles native dialogs and application
@@ -50,7 +50,9 @@ loading.
 | Camera, materials, viewport lifecycle | `src/components/ModelViewer.jsx` | Format dimensions plus actual Electron render |
 | New format or format correction | `src/formats/index.js`, individual adapter, `shared/formats.json` | `tests/formats.test.mjs`, small fixtures |
 | OpenSCAD parameters, rendering or part export | `electron/scad-parameters.cjs`, `electron/scad-engine.cjs`, `src/components/ScadPanel.jsx` | OpenSCAD tests and `scripts/smoke-scad.mjs` |
-| Registration, watching, metadata or schema | `electron/library.cjs` | `tests/library.test.cjs` |
+| OpenSCAD presets | `electron/scad-presets.cjs`, `src/components/ScadPresetControls.jsx`, `src/components/useScadWorkspace.js` | `tests/scad-presets.test.cjs`, OpenSCAD smoke |
+| Registration, watching, metadata or schema | `electron/library.cjs`, `electron/library-store.cjs` | `tests/library.test.cjs` |
+| Bambu Studio print handoff | `electron/bambu-print.cjs` | `tests/bambu-print.test.cjs` |
 | Native feature or new renderer capability | Guarded handler in `electron/main.cjs`, named API in `electron/preload.cjs` | Backend test plus actual IPC smoke |
 | Memory policy | `shared/preview-memory.json`, CJS/ESM policy helpers | `tests/preview-memory.test.mjs`, reader/adapter cases |
 | Thumbnail scheduling | `electron/thumbnail-batch.cjs`, main worker lifecycle | `tests/thumbnail-batch.test.cjs`, thumbnail smoke |
@@ -59,19 +61,25 @@ loading.
 
 ## Library state and persistence
 
-`Library` owns `library.json` under Electron's `userData` directory.
+`Library` owns `library.sqlite3` under Electron's `userData` directory.
 `NINE_DATA_DIR` overrides that directory. `NINE_TEST_MODE` bypasses the
 single-instance lock; it does not select a separate directory or disable file
 operations. UI snapshots include transient `status` and OS memory information
 under `system`; those fields are not part of the persisted library schema.
 
-The persisted `schemaVersion: 1` contains:
+SQLite uses row-level updates, transactions, foreign keys and WAL. Main retains a
+metadata projection for current UI filtering and file watches. Its snapshots
+contain thumbnail presence and revision only. Each visible card can fetch an
+individual thumbnail BLOB through a guarded call. The UI mounts 48 cards per page.
+
+The catalog persists:
 
 | Field | Contract |
 | --- | --- |
-| `items` | Records with `id`, `name`, absolute `path`, `format`, byte `size`, ISO `modifiedAt`/`addedAt`, `missing`, `favorite`, `tags`, `notes`, and optional image `thumbnail` data URL |
+| Models | ID, name, absolute path, format, size, modified/added timestamps, missing state, favorite, tags and notes |
+| Thumbnails | BLOB, MIME and revision per model |
 | `folders` | Watched folder records `{ id, path }` |
-| `settings` | `bambuPath`, `openscadPath`, `memoryBudgetMiB`. Preserve unrelated keys during changes. |
+| `settings` | Bambu/OpenSCAD paths, manual read budget, lightweight policy and unrelated inherited keys |
 | `excludedPaths` | Normalized paths suppressed after registration-only removal |
 
 IDs are a truncated SHA-256 of a resolved, case-folded path. Identical contents
@@ -79,10 +87,11 @@ at different paths are separate entries. A rename or move produces a missing
 old entry and a separately registered new path. Do not change that identity
 rule without a migration plan.
 
-Mutations use a promise queue. Persistence writes a temporary file beside the
-library and renames it over the destination; it then broadcasts a state snapshot.
-Startup refuses unreadable/corrupt existing JSON rather than overwriting it.
-Missing or invalid saved memory settings migrate to the configured default.
+Mutations use a promise queue and publish only after committing. Initial
+conversion reads and validates the legacy JSON, commits the import as a unit and
+leaves the JSON unchanged. Existing unreadable/corrupt data is reported with an
+error. The first window can use the stored catalog while watcher reconciliation
+runs in the background.
 
 Chokidar watches recursively, waits for stable writes, and ignores application
 data and common repository/dependency directories. Startup and explicit rescan
@@ -135,7 +144,15 @@ relative project dependencies.
 Preview requests render to a temporary binary STL, apply the preview budget,
 and use the existing STL loader. Model changes abort and discard obsolete
 previews. Thumbnail jobs render source defaults to keep library images stable.
-All three workflows share a single native process slot.
+Preview, thumbnail, export and print preparation share a single native process
+slot. Bambu Studio receives the original STL/STEP/3MF or a bounded temporary
+binary STL for SCAD. Studio owns the printer connection, slicing and send
+confirmation. A successful handoff indicates process launch, not print status.
+
+Presets store explicit public overrides per model and validate against its
+current parameter definitions on save and use. Customizer JSON only carries
+preset names and parameter values. Applying a preset updates the editor, so a
+render only starts when explicitly requested.
 
 STL export passes the current overrides, optionally replacing one enum with
 the selected part values. Jobs are sequential, check the source before render
@@ -164,14 +181,15 @@ prevents the next target from starting.
 
 `processed = succeeded + failed + skipped`; cancellation can leave it below
 `total`. Reports contain counts, scope, timestamps, the current item, and errors,
-not model bytes or thumbnail images. `thumbnail-batch.json` persists the latest
-run. A previously running/stopping report becomes cancelled after restart.
+not model bytes or thumbnail images. SQLite persists the latest run and imports
+the earlier `thumbnail-batch.json` if present. A previously running/stopping
+report becomes cancelled after restart.
 `reportError` exposes persistence problems to the live UI.
 
 Batch saves pass an expected source to `saveThumbnail()`, which checks the
 registered path/size/mtime and the actual file before committing the image.
-The legacy two-argument save API remains for the viewport. New asynchronous
-thumbnail producers should supply the expected source.
+The viewport passes an expected source as well. Background work should always
+validate the file that produced its derived image before it saves it.
 
 ## Copy, registration removal, and trash
 

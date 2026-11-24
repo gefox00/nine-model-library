@@ -1,6 +1,6 @@
 {
   "name": "nine-model-library",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "private": true,
   "license": "MPL-2.0",
   "description": "A local STL, STEP and 3MF library for makers",

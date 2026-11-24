@@ -1,5 +1,6 @@
 {
   "defaultBudgetMiB": 2048,
+  "lightweightBudgetMiB": 512,
   "minBudgetMiB": 512,
   "maxBudgetMiB": 32768,
   "budgetsMiB": [512, 1024, 2048, 4096, 8192, 16384, 32768],

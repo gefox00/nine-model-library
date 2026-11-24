@@ -11,6 +11,10 @@ function normalizeMemoryBudget(value) {
   try { return assertMemoryBudget(value); } catch { return config.defaultBudgetMiB; }
 }
 
+function effectivePreviewBudget(settings = {}) {
+  return settings.lightweightPreview === false ? normalizeMemoryBudget(settings.memoryBudgetMiB) : config.lightweightBudgetMiB;
+}
+
 // Keep the renderer calculation equivalent; parity is checked in preview-memory.test.mjs.
 function resolvePreviewLimits(value = config.defaultBudgetMiB) {
   const budgetMiB = normalizeMemoryBudget(value);
@@ -20,4 +24,4 @@ function resolvePreviewLimits(value = config.defaultBudgetMiB) {
   ]));
 }
 
-module.exports = { PREVIEW_MEMORY_CONFIG: config, assertMemoryBudget, normalizeMemoryBudget, resolvePreviewLimits };
+module.exports = { PREVIEW_MEMORY_CONFIG: config, assertMemoryBudget, normalizeMemoryBudget, effectivePreviewBudget, resolvePreviewLimits };

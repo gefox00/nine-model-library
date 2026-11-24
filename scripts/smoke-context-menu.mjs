@@ -6,9 +6,9 @@ import { fileURLToPath } from 'node:url';
 
 const root = fileURLToPath(new URL('../', import.meta.url));
 const packaged = process.argv.includes('--packaged');
-const executablePath = path.join(root, packaged
-  ? 'release/win-unpacked/Nine Model Library.exe'
-  : 'node_modules/electron/dist/electron.exe');
+const releaseDirectory = process.argv.find(arg => arg.startsWith('--release-dir='))?.slice('--release-dir='.length) || 'release';
+const executablePath = packaged ? path.resolve(root, releaseDirectory, 'win-unpacked/Nine Model Library.exe')
+  : path.join(root, 'node_modules/electron/dist/electron.exe');
 const output = path.join(root, 'output', 'playwright');
 await fs.mkdir(output, { recursive: true });
 const directory = await fs.mkdtemp(path.join(output, 'context-menu-'));
@@ -82,8 +82,11 @@ try {
   const result = await page.evaluate(() => window.nine.getThumbnailBatch());
   assert.deepEqual([result.scope, result.total, result.succeeded], ['single', 1, 1]);
   const registered = await page.evaluate(() => window.nine.getState());
-  assert.match(registered.items.find(item => item.name === path.basename(step)).thumbnail, /^data:image\//);
-  assert.equal(registered.items.find(item => item.name === path.basename(stl)).thumbnail, undefined);
+  const stepped = registered.items.find(item => item.name === path.basename(step));
+  assert.equal(stepped.hasThumbnail, true);
+  assert.match(await page.evaluate(id => window.nine.getThumbnail(id), stepped.id), /^data:image\//);
+  assert.equal(registered.items.find(item => item.name === path.basename(stl)).hasThumbnail, false);
+  assert(registered.items.every(item => !Object.hasOwn(item, 'thumbnail')));
 
   await choose(stl, 'プレビュー');
   await page.locator('[data-phase="ready"]').waitFor();
@@ -118,8 +121,9 @@ try {
   await assert.rejects(fs.stat(stl), { code: 'ENOENT' });
   assert(await fs.stat(path.join(trash, path.basename(stl))));
   assert(await fs.stat(step));
-  const saved = JSON.parse(await fs.readFile(path.join(data, 'library.json'), 'utf8'));
+  const saved = await page.evaluate(() => window.nine.getState());
   assert.deepEqual(saved.items.map(item => item.name), [path.basename(step)]);
+  assert(await fs.stat(path.join(data, 'library.sqlite3')));
   console.log('Context menu: five actions, keyboard, single STEP thumbnail, preview, copy/cancel/no overwrite, Bambu routing, and delete/cancel passed.');
 } finally {
   await app.close();

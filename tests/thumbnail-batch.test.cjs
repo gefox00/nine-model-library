@@ -203,11 +203,11 @@ test('thumbnail save rejects changed or removed source files and registration ch
   await library.importPaths([file]);
   let source = library.getState().items[0];
   await library.saveThumbnail(source.id, image, source);
-  assert.equal(library.item(source.id).thumbnail, image);
+  assert.equal(library.readThumbnail(source.id), image);
   await fs.writeFile(file, 'changed even before watcher notification');
   await assert.rejects(() => library.saveThumbnail(source.id, image, source), /更新された/);
   await library.rescan();
-  assert.equal(library.item(source.id).thumbnail, undefined);
+  assert.equal(library.readThumbnail(source.id), null);
   await assert.rejects(() => library.saveThumbnail(source.id, image, source), /更新された/);
   source = library.getState().items[0];
   await fs.unlink(file);
@@ -264,8 +264,8 @@ test('single scope replaces only the selected cached thumbnail through the norma
   const result = await batch.waitForIdle();
   assert.deepEqual(generated, [selected.id]);
   assert.deepEqual(saved, [selected.id]);
-  assert.equal(library.item(selected.id).thumbnail, replacement);
-  assert.equal(library.item(untouched.id).thumbnail, image);
+  assert.equal(library.readThumbnail(selected.id), replacement);
+  assert.equal(library.readThumbnail(untouched.id), image);
   assert.equal(result.scope, 'single');
   assert.equal(result.status, 'completed');
   assert.equal(result.total, 1);

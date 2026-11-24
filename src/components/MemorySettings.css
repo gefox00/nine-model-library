@@ -19,3 +19,4 @@
 .memory-details p{margin:8px 0 0;padding:0 4px;line-height:1.8;font-size:10px;color:#8093aa}
 .memory-actions{display:flex;flex-wrap:wrap;align-items:center;gap:9px}
 .memory-settings p.memory-apply-note{font-size:9px;color:#657e98;margin:12px 0 0}
+.memory-mode{display:flex;align-items:center;gap:8px;margin:12px 0 7px;color:#c7e5ad;font-size:12px;font-weight:600}
