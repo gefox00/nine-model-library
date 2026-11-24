@@ -12,7 +12,8 @@ Keep changes focused on the requested behavior and preserve existing library dat
 - `src/` owns React UI, Three.js rendering, and format adapters. It uses ES modules.
   Do not import Node.js APIs into a renderer or expose unrestricted IPC/filesystem
   access through a preload.
-- `shared/formats.json` and `src/formats/index.js` must agree when adding formats.
+- `shared/formats.json` registers source files. `src/formats/index.js` registers
+  mesh loaders. OpenSCAD is converted to STL in main before it reaches a loader.
   Adapters return geometry in millimeters with Z up, accept cancellation and
   preview limits, and dispose resources on failure or cancellation.
 - `shared/preview-memory.json` defines preview policy. Keep its main-process and
@@ -42,6 +43,10 @@ Keep changes focused on the requested behavior and preserve existing library dat
   removal and moving the source to the Recycle Bin have different exclusion rules.
 - Bambu Studio receives the original file through `spawn(executable, [path],
   { shell: false })`. Do not substitute a preview mesh for the original project.
+- OpenSCAD runs as an external process with no shell and the original source
+  directory as its working directory. Only validated Customizer literals may
+  become parameter overrides. Keep previews in temporary files and never
+  overwrite the source or existing destination STLs.
 
 ## Verification
 
@@ -54,9 +59,11 @@ npm test
 npm run build
 node scripts/smoke-thumbnails.mjs
 node scripts/smoke-context-menu.mjs
+node scripts/smoke-scad.mjs
 ```
 
 Run the smoke test relevant to the change, not every expensive check by default.
+The OpenSCAD smoke test requires an installed OpenSCAD executable.
 For a packaging change, run `npm run package` and rerun the relevant smoke script
 with `--packaged`. Both HTML entry points and local STEP/WASM assets must work
 from the packaged app, not only from the Vite development server.

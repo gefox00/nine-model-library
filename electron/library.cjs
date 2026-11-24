@@ -4,17 +4,18 @@ const path = require('node:path');
 const crypto = require('node:crypto');
 const os = require('node:os');
 const { EventEmitter } = require('node:events');
+const { detectOpenScad } = require('./scad-engine.cjs');
 const { resolvePreviewLimits, normalizeMemoryBudget, assertMemoryBudget, PREVIEW_MEMORY_CONFIG } = require('../shared/preview-memory.cjs');
 
 let formats;
 try { formats = require('../shared/formats.json'); }
-catch { formats = [{ id: 'stl', extensions: ['stl'] }, { id: 'step', extensions: ['step', 'stp'] }, { id: '3mf', extensions: ['3mf'] }]; }
+catch { formats = [{ id: 'stl', extensions: ['stl'] }, { id: 'step', extensions: ['step', 'stp'] }, { id: '3mf', extensions: ['3mf'] }, { id: 'scad', extensions: ['scad'] }]; }
 const formatByExtension = new Map(formats.flatMap(f => f.extensions.map(e => [e.toLowerCase(), f.id])));
 const normalize = value => path.resolve(value).replace(/[\\/]+$/, '').toLowerCase();
 const idFor = value => crypto.createHash('sha256').update(normalize(value)).digest('hex').slice(0, 24);
 const isInside = (target, directory) => normalize(target) === normalize(directory) || normalize(target).startsWith(normalize(directory) + path.sep.toLowerCase());
 const formatFor = file => formatByExtension.get(path.extname(file).slice(1).toLowerCase());
-const freshData = () => ({ schemaVersion: 1, items: [], folders: [], settings: { bambuPath: '', memoryBudgetMiB: normalizeMemoryBudget(undefined) }, excludedPaths: [] });
+const freshData = () => ({ schemaVersion: 1, items: [], folders: [], settings: { bambuPath: '', openscadPath: '', memoryBudgetMiB: normalizeMemoryBudget(undefined) }, excludedPaths: [] });
 function assertModelSizeAllowed(size, memoryBudgetMiB) {
   assertMemoryBudget(memoryBudgetMiB);
   const limit = resolvePreviewLimits(memoryBudgetMiB).fileBytes;
@@ -52,6 +53,9 @@ class Library extends EventEmitter {
     }
     if (!this.data.settings.bambuPath) {
       this.data.settings.bambuPath = await this.detectBambu();
+    }
+    if (!this.data.settings.openscadPath) {
+      this.data.settings.openscadPath = (await detectOpenScad()) || '';
     }
     await this.rescan();
     await this.startWatchers();
@@ -404,6 +408,18 @@ class Library extends EventEmitter {
     return this.enqueue(async () => {
       if (typeof file !== 'string' || path.extname(file).toLowerCase() !== '.exe' || !(await fs.stat(file)).isFile()) throw new Error('Bambu Studioの実行ファイルを選んでください');
       this.data.settings.bambuPath = path.resolve(file);
+      await this.persist();
+      return this.getState();
+    });
+  }
+
+  setOpenScadPath(file) {
+    return this.enqueue(async () => {
+      if (typeof file !== 'string' || !path.isAbsolute(file) || !/\.exe$/i.test(file) ||
+          !(await fs.stat(file).catch(() => null))?.isFile()) {
+        throw new Error('OpenSCADの実行ファイル（.exe）を選んでください');
+      }
+      this.data.settings.openscadPath = file;
       await this.persist();
       return this.getState();
     });

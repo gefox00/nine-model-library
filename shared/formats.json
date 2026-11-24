@@ -1,5 +1,6 @@
 [
   {"id":"stl","label":"STL","extensions":["stl"]},
   {"id":"step","label":"STEP","extensions":["step","stp"]},
-  {"id":"3mf","label":"3MF","extensions":["3mf"]}
+  {"id":"3mf","label":"3MF","extensions":["3mf"]},
+  {"id":"scad","label":"OpenSCAD","extensions":["scad"]}
 ]

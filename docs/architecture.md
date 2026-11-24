@@ -49,6 +49,7 @@ loading.
 | Search, sorting, selection, file actions | `src/App.jsx`, `src/components/ModelContextMenu.jsx` | Context-menu smoke and affected UI flow |
 | Camera, materials, viewport lifecycle | `src/components/ModelViewer.jsx` | Format dimensions plus actual Electron render |
 | New format or format correction | `src/formats/index.js`, individual adapter, `shared/formats.json` | `tests/formats.test.mjs`, small fixtures |
+| OpenSCAD parameters, rendering or part export | `electron/scad-parameters.cjs`, `electron/scad-engine.cjs`, `src/components/ScadPanel.jsx` | OpenSCAD tests and `scripts/smoke-scad.mjs` |
 | Registration, watching, metadata or schema | `electron/library.cjs` | `tests/library.test.cjs` |
 | Native feature or new renderer capability | Guarded handler in `electron/main.cjs`, named API in `electron/preload.cjs` | Backend test plus actual IPC smoke |
 | Memory policy | `shared/preview-memory.json`, CJS/ESM policy helpers | `tests/preview-memory.test.mjs`, reader/adapter cases |
@@ -70,7 +71,7 @@ The persisted `schemaVersion: 1` contains:
 | --- | --- |
 | `items` | Records with `id`, `name`, absolute `path`, `format`, byte `size`, ISO `modifiedAt`/`addedAt`, `missing`, `favorite`, `tags`, `notes`, and optional image `thumbnail` data URL |
 | `folders` | Watched folder records `{ id, path }` |
-| `settings` | `bambuPath`, `memoryBudgetMiB`; preserve unrelated keys during changes |
+| `settings` | `bambuPath`, `openscadPath`, `memoryBudgetMiB`. Preserve unrelated keys during changes. |
 | `excludedPaths` | Normalized paths suppressed after registration-only removal |
 
 IDs are a truncated SHA-256 of a resolved, case-folded path. Identical contents
@@ -122,6 +123,26 @@ archive/XML data, triangles, instances, and depth. Preserve all stages: compress
 file size alone cannot bound the cost of a 3MF. Clean up geometries, materials,
 textures, renderers, and workers when their rendering lifetime ends, including
 failure, superseded loads, and abort.
+
+## OpenSCAD source files
+
+The parser reads public literal declarations from the main SCAD file's
+Customizer header. It does not evaluate source expressions. The main process
+validates the incoming type and optional range/enum, then passes each override to
+OpenSCAD as a CLI argument. The original source stays in place to resolve
+relative project dependencies.
+
+Preview requests render to a temporary binary STL, apply the preview budget,
+and use the existing STL loader. Model changes abort and discard obsolete
+previews. Thumbnail jobs render source defaults to keep library images stable.
+All three workflows share a single native process slot.
+
+STL export passes the current overrides, optionally replacing one enum with
+the selected part values. Jobs are sequential, check the source before render
+and save, and use exclusive copies into the chosen destination. Output filenames
+for a part are independent of which other parts were selected. The UI skips
+recognizable assembly and preview options in the all-parts list. It leaves
+those options available in the explicit selection modes.
 
 ## Thumbnail runs
 

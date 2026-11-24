@@ -4,6 +4,7 @@ const fs = require('node:fs/promises');
 const { spawn } = require('node:child_process');
 const { Library } = require('./library.cjs');
 const { ThumbnailBatch, abortError } = require('./thumbnail-batch.cjs');
+const scad = require('./scad-engine.cjs');
 const formats = require('../shared/formats.json');
 
 app.setName('Nine Model Library');
@@ -11,6 +12,8 @@ let library;
 let mainWindow;
 let thumbnailBatch;
 let activeThumbnailWorker = null;
+const scadRenders = new Map();
+let scadExport = null;
 let quitting = false;
 
 if (process.env.NINE_DATA_DIR) app.setPath('userData', path.resolve(process.env.NINE_DATA_DIR));
@@ -94,6 +97,67 @@ async function boot() {
   });
   handle('readModel', (id, options) => library.readModel(id, options));
   handle('updateSettings', patch => library.updateSettings(patch));
+  handle('chooseOpenScad', async () => {
+    const result = await dialog.showOpenDialog(mainWindow, {
+      title: 'OpenSCADの実行ファイル', defaultPath: library.data.settings.openscadPath || await scad.detectOpenScad() || undefined,
+      properties: ['openFile'], filters: [{ name: 'OpenSCAD', extensions: ['exe', 'com'] }],
+    });
+    if (result.canceled || !result.filePaths.length) return library.getState();
+    return library.setOpenScadPath(await scad.resolveExecutable(result.filePaths[0]));
+  });
+  handle('getScadParameters', async id => {
+    requireScadItem(id);
+    const source = await library.captureFileSource(id);
+    const result = await scad.readScadParameters(source.path);
+    await library.assertThumbnailSource(id, source, 'パラメータ読み取り');
+    return result;
+  });
+  handle('renderScad', async (id, values, requestId) => {
+    requireScadItem(id);
+    validateScadRequestId(requestId);
+    if (scadRenders.has(requestId)) throw new Error('同じOpenSCAD要求がすでに実行中です');
+    if (scadRenders.size >= 8) throw new Error('OpenSCADの待機中要求が多すぎます。前の処理を中止してください');
+    const controller = new AbortController();
+    scadRenders.set(requestId, controller);
+    try {
+      const source = await library.captureFileSource(id);
+      const result = await scad.renderScad({ executable: library.data.settings.openscadPath,
+        sourcePath: source.path, values: values ?? {}, memoryBudgetMiB: library.data.settings.memoryBudgetMiB, signal: controller.signal });
+      controller.signal.throwIfAborted();
+      await library.assertThumbnailSource(id, source, 'プレビュー生成');
+      return result;
+    } finally { scadRenders.delete(requestId); }
+  });
+  handle('cancelScadRender', requestId => {
+    validateScadRequestId(requestId);
+    const controller = scadRenders.get(requestId);
+    if (!controller) return false;
+    controller.abort(abortError('OpenSCADのプレビューを中止しました'));
+    return true;
+  });
+  handle('exportScad', async (id, options) => {
+    requireScadItem(id);
+    if (scadExport) throw new Error('OpenSCADの書き出しはすでに実行中です');
+    const controller = new AbortController();
+    scadExport = controller;
+    try {
+      const source = await library.captureFileSource(id);
+      await scad.prepareScadExport(source.path, options);
+      const choice = await dialog.showOpenDialog(mainWindow, { title: 'STLの書き出し先', properties: ['openDirectory'] });
+      if (choice.canceled || !choice.filePaths.length) return null;
+      return await scad.exportScad({ executable: library.data.settings.openscadPath, sourcePath: source.path,
+        directory: choice.filePaths[0], values: options?.values, selector: options?.selector, parts: options?.parts,
+        signal: controller.signal, validateSource: () => library.assertThumbnailSource(id, source, 'STL書き出し'),
+        onProgress: state => {
+          if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('nine:scad-export', state);
+        } });
+    } finally { scadExport = null; }
+  });
+  handle('cancelScadExport', () => {
+    if (!scadExport) return false;
+    scadExport.abort(abortError('STL書き出しを中止しました'));
+    return true;
+  });
   handle('saveThumbnail', (id, dataUrl, expectedSource) => library.saveThumbnail(id, dataUrl, expectedSource));
   handle('getThumbnailBatch', () => thumbnailBatch.getState());
   handle('generateThumbnail', async id => {
@@ -125,6 +189,7 @@ async function boot() {
   });
   handle('openBambu', async id => {
     const item = library.item(id);
+    if (item.format === 'scad') throw new Error('OpenSCADソースはBambu Studioで開けません。STLに書き出してから開いてください');
     const executable = library.data.settings.bambuPath;
     if (!executable) throw new Error('設定でBambu Studioの実行ファイルを選んでください');
     await fs.access(executable).catch(() => { throw new Error('Bambu Studioが見つかりません。設定で実行ファイルを選び直してください'); });
@@ -138,6 +203,16 @@ async function boot() {
   });
   createWindow();
   app.on('activate', () => { if (!BrowserWindow.getAllWindows().length) createWindow(); });
+}
+
+function requireScadItem(id) {
+  const item = library.item(id);
+  if (item.format !== 'scad' || path.extname(item.path).toLowerCase() !== '.scad') throw new Error('OpenSCADファイルを選んでください');
+  return item;
+}
+
+function validateScadRequestId(requestId) {
+  if (typeof requestId !== 'string' || !/^[A-Za-z0-9_.:-]{1,128}$/.test(requestId)) throw new Error('OpenSCADの要求IDが不正です');
 }
 
 function createWindow() {
@@ -170,10 +245,17 @@ function registerThumbnailWorkerIpc() {
     if (task.inputRequested) throw new Error('モデルはすでに読み込み済みです');
     task.inputRequested = true;
     await library.assertThumbnailSource(task.item.id, task.item);
-    const bytes = await library.readModel(task.item.id, { memoryBudgetMiB: task.memoryBudgetMiB, signal: task.signal });
+    let bytes;
+    let displayItem = task.item;
+    if (task.item.format === 'scad') {
+      const rendered = await scad.renderScad({ executable: library.data.settings.openscadPath, sourcePath: task.item.path,
+        values: {}, memoryBudgetMiB: task.memoryBudgetMiB, signal: task.signal });
+      bytes = rendered.bytes;
+      displayItem = { ...task.item, format: 'stl', name: `${path.basename(task.item.name, path.extname(task.item.name))}.stl` };
+    } else bytes = await library.readModel(task.item.id, { memoryBudgetMiB: task.memoryBudgetMiB, signal: task.signal });
     task.signal.throwIfAborted();
     if (activeThumbnailWorker !== task) throw abortError();
-    return { item: task.item, bytes, memoryBudgetMiB: task.memoryBudgetMiB };
+    return { item: displayItem, bytes, memoryBudgetMiB: task.memoryBudgetMiB };
   });
   ipcMain.handle('nine-thumb:complete', (event, result) => {
     const task = authenticateThumbnailWorker(event);
@@ -238,6 +320,8 @@ app.on('window-all-closed', () => { if (process.platform !== 'darwin') app.quit(
 app.on('before-quit', event => {
   if (library && !quitting) {
     event.preventDefault(); quitting = true;
-    Promise.resolve(thumbnailBatch?.close()).then(() => library.close()).finally(() => app.quit());
+    for (const controller of scadRenders.values()) controller.abort(abortError('アプリを終了しています'));
+    scadExport?.abort(abortError('アプリを終了しています'));
+    Promise.resolve(thumbnailBatch?.close()).then(() => scad.waitForScadIdle()).then(() => library.close()).finally(() => app.quit());
   }
 });

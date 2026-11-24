@@ -1,6 +1,6 @@
 {
   "name": "nine-model-library",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "private": true,
   "description": "A local STL, STEP and 3MF library for makers",
   "type": "module",

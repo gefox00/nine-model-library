@@ -13,6 +13,17 @@ contextBridge.exposeInMainWorld('nine', {
   trashModel: id => invoke('trashModel', id),
   readModel: (id, options) => invoke('readModel', id, options),
   updateSettings: patch => invoke('updateSettings', patch),
+  chooseOpenScad: () => invoke('chooseOpenScad'),
+  getScadParameters: id => invoke('getScadParameters', id),
+  renderScad: (id, values, requestId) => invoke('renderScad', id, values, requestId),
+  cancelScadRender: requestId => invoke('cancelScadRender', requestId),
+  exportScad: (id, options) => invoke('exportScad', id, options),
+  cancelScadExport: () => invoke('cancelScadExport'),
+  onScadExport: callback => {
+    const listener = (_event, state) => callback(state);
+    ipcRenderer.on('nine:scad-export', listener);
+    return () => ipcRenderer.removeListener('nine:scad-export', listener);
+  },
   saveThumbnail: (id, dataUrl, expectedSource) => invoke('saveThumbnail', id, dataUrl, expectedSource),
   startThumbnailBatch: (options = {}) => invoke('startThumbnailBatch', options),
   stopThumbnailBatch: () => invoke('stopThumbnailBatch'),

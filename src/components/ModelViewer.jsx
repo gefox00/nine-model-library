@@ -107,18 +107,23 @@ export default function ModelViewer({
   memoryBudgetMiB = 2048,
   reloadToken = 0,
   onOpenMemorySettings,
+  scadValues,
+  scadExecutable,
+  onPhaseChange,
 }) {
   const mountRef = useRef(null);
   const engineRef = useRef(null);
   const callbacksRef = useRef({ onMetadata, onThumbnail });
-  const optionsRef = useRef({ viewMode, showGrid, autoRotate, viewPreset, memoryBudgetMiB });
+  const optionsRef = useRef({ viewMode, showGrid, autoRotate, viewPreset, memoryBudgetMiB, scadValues });
   const [phase, setPhase] = useState('empty');
   const [error, setError] = useState('');
   const [gridStep, setGridStep] = useState(null);
   const [previewImage, setPreviewImage] = useState(null);
   const [retryToken, setRetryToken] = useState(0);
   callbacksRef.current = { onMetadata, onThumbnail };
-  optionsRef.current = { viewMode, showGrid, autoRotate, viewPreset, memoryBudgetMiB };
+  optionsRef.current = { viewMode, showGrid, autoRotate, viewPreset, memoryBudgetMiB, scadValues };
+
+  useEffect(() => { onPhaseChange?.(phase); }, [phase, onPhaseChange]);
 
   useEffect(() => {
     const host = mountRef.current;
@@ -255,12 +260,21 @@ export default function ModelViewer({
     // Keep a single budget for disk reading and format expansion. Saving a new
     // setting alone must not unexpectedly restart a large model.
     const loadBudgetMiB = optionsRef.current.memoryBudgetMiB;
+    const isScad = item.format === 'scad';
+    const overrides = optionsRef.current.scadValues || {};
+    let scadRequestId;
     (async () => {
       let loadedObject;
       try {
-        const bytes = await window.nine.readModel(item.id, { memoryBudgetMiB: loadBudgetMiB });
+        if (isScad && !scadExecutable) throw new Error('設定からOpenSCADの実行ファイルを指定してください。');
+        const input = isScad
+          ? await window.nine.renderScad(item.id, overrides, (scadRequestId = crypto.randomUUID()))
+          : { bytes: await window.nine.readModel(item.id, { memoryBudgetMiB: loadBudgetMiB }) };
+        scadRequestId = undefined;
         if (cancelled) return;
-        const result = await loadModel(bytes, { filename: item.name, signal: controller.signal, memoryBudgetMiB: loadBudgetMiB });
+        const filename = isScad ? `${item.name}.stl` : item.name;
+        const result = await loadModel(input.bytes, { filename, signal: controller.signal, memoryBudgetMiB: loadBudgetMiB });
+        if (isScad) result.warnings = input.warnings || [];
         loadedObject = result.object;
         if (cancelled || engineRef.current !== engine) {
           disposeObject(loadedObject);
@@ -326,7 +340,7 @@ export default function ModelViewer({
         canvas.height = 260;
         const context = canvas.getContext('2d');
         const source = engine.renderer.domElement;
-        if (context && source.width && source.height) {
+        if (context && source.width && source.height && (!isScad || !Object.keys(overrides).length)) {
           const scale = Math.min(canvas.width / source.width, canvas.height / source.height);
           const width = source.width * scale;
           const height = source.height * scale;
@@ -338,12 +352,16 @@ export default function ModelViewer({
       } catch (cause) {
         if (cancelled || cause?.name === 'AbortError') return;
         if (loadedObject && !engine.model) disposeObject(loadedObject);
-        setError(cause?.message || String(cause));
+        setError(cause?.message?.replace(/^Error invoking remote method '[^']+': Error: /, '') || String(cause));
         setPhase('error');
       }
     })();
-    return () => { cancelled = true; controller.abort(); };
-  }, [item?.id, item?.modifiedAt, item?.missing, reloadToken, retryToken]);
+    return () => {
+      cancelled = true;
+      controller.abort();
+      if (scadRequestId) window.nine.cancelScadRender(scadRequestId).catch(() => {});
+    };
+  }, [item?.id, item?.modifiedAt, item?.missing, reloadToken, retryToken, scadExecutable]);
 
   useEffect(() => {
     const engine = engineRef.current;
@@ -378,7 +396,7 @@ export default function ModelViewer({
       {phase === 'loading' && (
         <div className="model-viewer__state model-viewer__state--loading" role="status">
           <div className="model-viewer__spinner" />
-          <h3>{['step', 'stp'].includes(item?.format?.toLowerCase()) ? 'STEPを変換中' : 'モデルを読み込み中'}</h3>
+          <h3>{item?.format === 'scad' ? 'OpenSCADで形状を計算中' : ['step', 'stp'].includes(item?.format?.toLowerCase()) ? 'STEPを変換中' : 'モデルを読み込み中'}</h3>
           <p>{item?.name}</p>
           <span>大きなモデルは少し時間がかかることがあります</span>
         </div>
