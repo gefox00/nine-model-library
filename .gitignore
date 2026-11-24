@@ -1,0 +1,17 @@
+node_modules/
+dist/
+release/
+output/
+public/occt/occt-import-js.js
+public/occt/occt-import-js.wasm
+*.log
+
+# Workstation-only utilities and test output
+/scripts/first-run.mjs
+/scripts/inspect-library-3mf.mjs
+/scripts/run-thumbnail-library.mjs
+/scripts/verify-memory-upgrade.mjs
+/library.json
+/thumbnail-batch.json
+/.env
+/.env.*

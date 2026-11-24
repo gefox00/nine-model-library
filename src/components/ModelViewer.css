@@ -1,0 +1,50 @@
+.model-viewer {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  min-height: 280px;
+  overflow: hidden;
+  background: #141b25;
+  border-radius: inherit;
+  isolation: isolate;
+}
+.model-viewer__canvas { position: absolute; inset: 0; }
+.model-viewer__canvas canvas { display: block; width: 100%; height: 100%; outline: none; cursor: grab; }
+.model-viewer__canvas canvas:active { cursor: grabbing; }
+.model-viewer__state {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-direction: column;
+  padding: 32px;
+  text-align: center;
+  color: #a0adbf;
+  pointer-events: none;
+  background: radial-gradient(ellipse at center, #24344955 0%, transparent 65%);
+}
+.model-viewer__state h3 { margin: 17px 0 9px; color: #e7edf5; font-size: 17px; font-weight: 500; letter-spacing: .03em; }
+.model-viewer__state p { margin: 0; max-width: 480px; overflow-wrap: anywhere; font-size: 12px; line-height: 1.8; }
+.model-viewer__state > span { margin-top: 20px; color: #6f8096; font-size: 11px; letter-spacing: .08em; }
+.model-viewer__empty-cube { width: 65px; height: 65px; font-size: 66px; line-height: 60px; color: #60768d; transform: rotate(-15deg); }
+.model-viewer__spinner { width: 31px; height: 31px; border: 2px solid #3a5267; border-top-color: #78d6ba; border-radius: 50%; animation: model-viewer-spin .8s linear infinite; }
+.model-viewer__error-symbol { width: 38px; height: 38px; display: grid; place-items: center; border: 1px solid #b28b64; border-radius: 50%; color: #f4bc83; font-size: 21px; }
+.model-viewer__state--error p { color: #c6a98b; }
+.model-viewer__error-actions { display: flex; flex-wrap: wrap; justify-content: center; gap: 9px; margin-top: 22px; pointer-events: auto; }
+.model-viewer__error-actions button { padding: 9px 13px; border: 1px solid #40546a; border-radius: 7px; background: #233346; color: #d7e7f2; font: inherit; font-size: 11px; cursor: pointer; }
+.model-viewer__error-actions button:hover { background: #2b4259; border-color: #668297; }
+.model-viewer__error-actions button:focus-visible { outline: 2px solid #78d6ba; outline-offset: 3px; }
+.model-viewer__hint { position: absolute; left: 50%; bottom: 19px; transform: translateX(-50%); display: flex; gap: 10px; white-space: nowrap; color: #74849a; font-size: 10px; pointer-events: none; }
+.model-viewer__hint span { color: #45556a; }
+.model-viewer__scale { position: absolute; right: 19px; top: 17px; color: #71839a; font-size: 10px; pointer-events: none; font-variant-numeric: tabular-nums; }
+.model-viewer__axis { position: absolute; left: 19px; bottom: 20px; width: 47px; height: 50px; font: 600 10px/1 system-ui, sans-serif; pointer-events: none; }
+.model-viewer__axis::before { content: ''; position: absolute; width: 1px; height: 25px; background: #79a4ed; left: 21px; top: 9px; }
+.model-viewer__axis-z { position: absolute; left: 18px; top: 0; color: #89b2fa; }
+.model-viewer__axis-x { position: absolute; left: 36px; top: 38px; color: #e49292; }
+.model-viewer__axis-x::before { content: ''; position: absolute; height: 1px; width: 20px; background: #c27b7b; transform: rotate(32deg); transform-origin: right; right: 5px; top: -2px; }
+.model-viewer__axis-y { position: absolute; left: 0; top: 38px; color: #7cc9b1; }
+.model-viewer__axis-y::before { content: ''; position: absolute; height: 1px; width: 20px; background: #699f93; transform: rotate(-32deg); transform-origin: left; left: 6px; top: -2px; }
+@keyframes model-viewer-spin { to { transform: rotate(360deg); } }
+@media (max-width: 1250px) { .model-viewer__hint { font-size: 9px; gap: 5px; bottom: 17px; } }
+@media (prefers-reduced-motion: reduce) { .model-viewer__spinner { animation-duration: 1.8s; } }

@@ -1,0 +1,21 @@
+.memory-budget-label{display:block;color:#a8bacd;font-size:11px;margin-bottom:9px}
+.memory-budget-row{display:flex;align-items:center;gap:10px}
+.memory-budget-row input{width:110px;padding:9px 11px;font-size:20px;font-weight:600;color:#d7efc0}
+.memory-budget-row>span{font-size:13px;color:#a6b79b}
+.memory-budget-row small{margin-left:auto;font-size:10px;color:#8a9bb0}
+.memory-presets{display:flex;flex-wrap:wrap;gap:6px;margin:12px 0}
+.memory-presets button{padding:7px 9px;border:1px solid #344353;border-radius:5px;color:#94a6ba;font-size:10px}
+.memory-presets button.selected{background:#31412d;border-color:#667d4e;color:#c9e8a8}
+.memory-presets button:hover{border-color:#9cb87c;color:#cfe3bb}
+.memory-settings p.memory-system{font-size:10px;color:#71869f;margin-bottom:16px}
+.memory-settings p.memory-validation{color:#edc196;font-size:11px}
+.memory-limit-grid{display:grid;grid-template-columns:1fr 1fr;gap:1px;background:#304050;border:1px solid #304050;border-radius:7px;overflow:hidden}
+.memory-limit-grid>div{display:flex;align-items:center;justify-content:space-between;padding:11px;background:#141e29;gap:10px}
+.memory-limit-grid span{font-size:10px;color:#8399b3}
+.memory-limit-grid b{font-size:11px;color:#bfd0df;font-weight:500;font-variant-numeric:tabular-nums}
+.memory-settings p.memory-footnote{font-size:10px;color:#8da0b8;margin-top:13px;margin-bottom:9px}
+.memory-details{font-size:10px;color:#7f92a9;margin:8px 0 16px}
+.memory-details summary{cursor:pointer;color:#93ad80}
+.memory-details p{margin:8px 0 0;padding:0 4px;line-height:1.8;font-size:10px;color:#8093aa}
+.memory-actions{display:flex;flex-wrap:wrap;align-items:center;gap:9px}
+.memory-settings p.memory-apply-note{font-size:9px;color:#657e98;margin:12px 0 0}

@@ -1,0 +1,11 @@
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; worker-src 'self' blob:; connect-src 'self' ws://localhost:* http://localhost:*; object-src 'none'" />
+    <title>Nine Thumbnail Worker</title>
+    <style>html,body{margin:0;background:#141b25;color:#a0adbf;font:12px system-ui,sans-serif}canvas{display:block}</style>
+  </head>
+  <body><script type="module" src="/src/thumbnail-worker.js"></script></body>
+</html>

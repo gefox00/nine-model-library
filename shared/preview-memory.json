@@ -1,0 +1,22 @@
+{
+  "defaultBudgetMiB": 2048,
+  "minBudgetMiB": 512,
+  "maxBudgetMiB": 32768,
+  "budgetsMiB": [512, 1024, 2048, 4096, 8192, 16384, 32768],
+  "baseLimits": {
+    "fileBytes": 268435456,
+    "xmlBytes": 134217728,
+    "archiveBytes": 402653184,
+    "triangles": 3000000,
+    "instances": 10000,
+    "depth": 80
+  },
+  "hardLimits": {
+    "fileBytes": 1073741824,
+    "xmlBytes": 268435456,
+    "archiveBytes": 2147483648,
+    "triangles": 24000000,
+    "instances": 80000,
+    "depth": 80
+  }
+}

@@ -1,0 +1,44 @@
+.model-context-menu {
+  position: fixed;
+  z-index: 80;
+  width: 238px;
+  max-height: calc(100vh - 16px);
+  overflow: auto;
+  padding: 5px;
+  background: #192330;
+  border: 1px solid #3b4c60;
+  border-radius: 8px;
+  box-shadow: 0 10px 26px #05090ea8;
+}
+
+.model-context-name {
+  margin: 0 4px 4px;
+  padding: 7px 5px 8px;
+  overflow: hidden;
+  border-bottom: 1px solid #304055;
+  color: #a0b0c5;
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.model-context-menu button {
+  display: flex;
+  width: 100%;
+  min-height: 34px;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 9px;
+  border-radius: 5px;
+  color: #e0e8f2;
+  font-size: 12px;
+  text-align: left;
+}
+
+.model-context-menu button svg { color: #9daec5; flex-shrink: 0; }
+.model-context-menu button:is(:hover, :focus-visible) { background: #29394c; outline-offset: -2px; }
+.model-context-menu button[aria-disabled="true"] { color: #78889a; cursor: default; }
+.model-context-menu button[aria-disabled="true"] svg { color: inherit; }
+.model-context-menu .model-context-delete { margin-top: 4px; border-top: 1px solid #304055; }
+.model-context-menu .model-context-delete:not([aria-disabled="true"]),
+.model-context-menu .model-context-delete:not([aria-disabled="true"]) svg { color: #ffb5a8; }

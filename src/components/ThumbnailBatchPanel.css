@@ -1,0 +1,25 @@
+.thumbnail-batch{margin:0 28px 17px;flex-shrink:0;background:#151e28;border:1px solid #2a3949;border-radius:8px;overflow:hidden}
+.thumbnail-batch-toolbar{display:flex;align-items:center;justify-content:space-between;padding:11px 14px;gap:12px}
+.thumbnail-batch-label{display:flex;align-items:center;gap:10px;color:#9db780;min-width:0}
+.thumbnail-batch-label b{display:block;font-size:11px;font-weight:500;color:#c2cfdb}
+.thumbnail-batch-label span{display:block;margin-top:4px;font-size:9px;color:#72879e}
+.thumbnail-batch-actions{display:flex;align-items:center;gap:9px;flex-shrink:0}
+.thumbnail-batch-actions select{font-size:10px;padding:8px;background:#121c26;max-width:120px}
+.thumbnail-batch-actions .secondary-button{height:33px;font-size:10px}
+.thumbnail-start{color:#c9e4aa!important;border-color:#526246!important}
+.thumbnail-batch-result{padding:0 14px 12px}
+.thumbnail-batch-progress-heading{display:flex;align-items:center;gap:14px;font-size:9px;color:#8398b2;flex-wrap:wrap;padding:4px 0 9px}
+.thumbnail-batch-progress-heading>b{display:flex;align-items:center;gap:6px;color:#b4cda1;font-weight:500}
+.thumbnail-batch-progress-heading strong{font-weight:500;color:#b5c8dc}
+.thumbnail-batch-count{font-variant-numeric:tabular-nums;color:#d1dce8!important}
+.thumbnail-batch-budget{margin-left:auto;font-size:8px;color:#647c96}
+.thumbnail-batch-progress{height:4px;background:#263647;border-radius:3px;overflow:hidden}
+.thumbnail-batch-progress i{display:block;height:100%;background:#b4d98a;transition:width .15s}
+.thumbnail-current{font-size:9px!important;color:#8297b2;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;padding-top:7px;margin:0!important}
+.thumbnail-failure-controls{display:flex;align-items:center;gap:18px}
+.thumbnail-failure-controls .text-button{font-size:9px;color:#b6a478}
+.thumbnail-failures{list-style:none;padding:0;margin:9px 0 0;max-height:126px;overflow:auto;border-top:1px solid #2c3a49}
+.thumbnail-failures li{padding:8px 3px;border-bottom:1px solid #253341}
+.thumbnail-failures b{display:block;font-size:9px;font-weight:500;color:#c7c1af;overflow-wrap:anywhere}
+.thumbnail-failures span{display:block;margin-top:4px;font-size:9px;color:#8c99a9;line-height:1.6;overflow-wrap:anywhere}
+@media(max-width:1250px){.thumbnail-batch{margin-left:20px;margin-right:20px}.thumbnail-batch-progress-heading{gap:10px}.thumbnail-batch-label span{font-size:8px}}

@@ -1,0 +1,11 @@
+import { spawn } from 'node:child_process';
+import path from 'node:path';
+const executable = path.resolve('release/win-unpacked/Nine Model Library.exe');
+const env = { ...process.env };
+delete env.ELECTRON_RUN_AS_NODE;
+delete env.NINE_DATA_DIR;
+delete env.NINE_TEST_MODE;
+const child = spawn(executable, [], { cwd: path.dirname(executable), detached: true, stdio: 'ignore', env });
+child.on('error', error => { console.error(error); process.exitCode = 1; });
+child.once('spawn', () => console.log(`Nine Model Library launched: PID ${child.pid}`));
+child.unref();
