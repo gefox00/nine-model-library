@@ -11,7 +11,14 @@ public/occt/occt-import-js.wasm
 /scripts/inspect-library-3mf.mjs
 /scripts/run-thumbnail-library.mjs
 /scripts/verify-memory-upgrade.mjs
-/library.json
-/thumbnail-batch.json
-/.env
-/.env.*
+
+# Private runtime data. Store real values outside the checkout.
+.private/
+.env
+.env.*
+.envrc
+.npmrc
+credentials.json
+secrets.json
+library.json
+thumbnail-batch.json

@@ -2,6 +2,7 @@
   "name": "nine-model-library",
   "version": "0.5.0",
   "private": true,
+  "license": "MPL-2.0",
   "description": "A local STL, STEP and 3MF library for makers",
   "type": "module",
   "main": "electron/main.cjs",
@@ -43,6 +44,7 @@
       "shared/**/*",
       "package.json"
     ],
+    "extraFiles": ["LICENSE"],
     "win": {
       "target": "dir",
       "signAndEditExecutable": false

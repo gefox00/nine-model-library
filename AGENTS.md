@@ -72,9 +72,28 @@ Use generated or committed test fixtures. Set `NINE_DATA_DIR` to an isolated tes
 directory for custom Electron verification; `NINE_TEST_MODE` alone does **not**
 isolate storage. Keep source models, user libraries, local paths, screenshots,
 logs, generated runtime binaries, and release output out of source commits.
-Before pushing, inspect the exact staged content for personal identifiers,
-embedded credentials, and hard-coded workstation paths. Check fixture metadata
-and archive members as well as text files. Use platform paths resolved at
-runtime and synthetic fixture metadata.
 Review any operational script before running it against the real user library.
 Report checks actually run and any remaining platform or integration limitation.
+
+## Private data and publishing
+
+- When real API keys, tokens, credentials, personal information, account or
+  device identifiers, private endpoints, or workstation-specific paths must
+  persist, write them to a private runtime file outside the Git checkout. Use the
+  OS-managed Electron `userData` directory by default. Resolve the location at
+  runtime and keep real private settings outside the checkout even if its data
+  directory is overridden for development or testing.
+- Keep those values out of all tracked files, including code, configuration
+  defaults, documentation, and fixtures. Use synthetic values in examples and
+  tests, and report missing required configuration without echoing its contents.
+  Keep private data out of publishable logs, screenshots, generated files, and
+  packages as well.
+- Before committing, inspect the exact staged snapshot for private values and
+  private files, including paths, fixture metadata, binary headers, and archive
+  members. Use `.gitignore` as a backup. Exclude private files explicitly and
+  remove any already staged copy from the index. Use a non-personal commit
+  identity for this public repository.
+- Before pushing, inspect the committed content and metadata of every commit
+  being sent, including data added and removed between commits. If a private
+  file or value appears, remove it from the entire unpublished commit range and
+  verify the corrected range before pushing.

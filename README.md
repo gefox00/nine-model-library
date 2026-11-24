@@ -108,4 +108,10 @@ npm run package
 
 OpenSCADをインストールした環境では、`node scripts/smoke-scad.mjs` でSCAD登録、サムネイル、公開パラメータ編集、4種類のSTL出力を確認できます。
 
-主な依存: Electron / React / Three.js / chokidar / fflate / occt-import-js。各依存のライセンスは配布フォルダ内のライセンス文書と `node_modules` 内の各パッケージを参照してください。
+## ライセンス
+
+Nine Model Libraryのオリジナルソースコードには Mozilla Public License 2.0（`MPL-2.0`）を適用します。ライセンス全文は [LICENSE](LICENSE) にあります。
+
+Electron、React、Three.js、chokidar、fflate、occt-import-jsなどの依存ライブラリには、それぞれのライセンスが適用されます。各ライブラリのライセンス文書を参照してください。
+
+Windows用パッケージには `LICENSE` を同梱します。実行ファイルを配布するときは、そのビルドに対応するソースコードの入手先も配布ページに記載してください。
