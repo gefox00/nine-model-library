@@ -203,11 +203,11 @@ test('thumbnail save rejects changed or removed source files and registration ch
   await library.importPaths([file]);
   let source = library.getState().items[0];
   await library.saveThumbnail(source.id, image, source);
-  assert.equal(library.readThumbnail(source.id), image);
+  assert.deepEqual(library.readThumbnailImage(source.id), { mime: 'image/png', bytes: Uint8Array.of(97, 98, 99) });
   await fs.writeFile(file, 'changed even before watcher notification');
   await assert.rejects(() => library.saveThumbnail(source.id, image, source), /更新された/);
   await library.rescan();
-  assert.equal(library.readThumbnail(source.id), null);
+  assert.equal(library.readThumbnailImage(source.id), null);
   await assert.rejects(() => library.saveThumbnail(source.id, image, source), /更新された/);
   source = library.getState().items[0];
   await fs.unlink(file);
@@ -264,8 +264,8 @@ test('single scope replaces only the selected cached thumbnail through the norma
   const result = await batch.waitForIdle();
   assert.deepEqual(generated, [selected.id]);
   assert.deepEqual(saved, [selected.id]);
-  assert.equal(library.readThumbnail(selected.id), replacement);
-  assert.equal(library.readThumbnail(untouched.id), image);
+  assert.deepEqual(library.readThumbnailImage(selected.id), { mime: 'image/png', bytes: Uint8Array.of(110, 101, 119) });
+  assert.deepEqual(library.readThumbnailImage(untouched.id), { mime: 'image/png', bytes: Uint8Array.of(97, 98, 99) });
   assert.equal(result.scope, 'single');
   assert.equal(result.status, 'completed');
   assert.equal(result.total, 1);

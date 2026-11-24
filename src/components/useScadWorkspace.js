@@ -7,7 +7,7 @@ const errorText = error => error?.message?.replace(/^Error invoking remote metho
 
 export default function useScadWorkspace(item, onError) {
   const itemId = item?.id;
-  const modelKey = item ? `${item.id}:${item.modifiedAt}:${item.missing}` : null;
+  const modelKey = item ? `${item.id}:${item.path}:${item.modifiedAt}:${item.missing}` : null;
   const [parameters, setParameters] = useState(null);
   const [draft, setDraft] = useState(null);
   const [preview, setPreview] = useState(null);

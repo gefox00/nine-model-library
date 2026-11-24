@@ -83,7 +83,8 @@ export default function App() {
     return state.items.filter(item => {
       const itemPath = item.path.toLocaleLowerCase();
       const folderMatch = !prefix || itemPath.startsWith(prefix + '\\') || itemPath.startsWith(prefix + '/');
-      return (section !== 'favorites' || item.favorite) && folderMatch && (format === 'all' || item.format === format || (format === 'step' && item.format === 'stp')) && (!query || `${item.name} ${item.path} ${(item.tags || []).join(' ')} ${item.notes || ''}`.toLocaleLowerCase().includes(query));
+      const sectionMatch = section === 'favorites' ? item.favorite : section === 'missing' ? item.missing : folderMatch;
+      return sectionMatch && (format === 'all' || item.format === format || (format === 'step' && item.format === 'stp')) && (!query || `${item.name} ${item.path} ${(item.tags || []).join(' ')} ${item.notes || ''}`.toLocaleLowerCase().includes(query));
     }).sort((a, b) => sort === 'name' ? a.name.localeCompare(b.name, 'ja') : sort === 'size' ? b.size - a.size : new Date(b.modifiedAt) - new Date(a.modifiedAt));
   }, [state.items, state.folders, deferredSearch, section, format, sort]);
   const pageCount = Math.max(1, Math.ceil(items.length / PAGE_SIZE));
@@ -151,9 +152,20 @@ export default function App() {
 
   function modelActionDisabled(id) {
     if (id === 'preview') return false;
+    if (id === 'relink') return busy || !contextItem.missing;
     if (contextItem.format === 'scad' && (id === 'bambu' || id === 'thumbnail') && !scadExecutable) return true;
     if (id === 'bambu' && printJob?.status === 'preparing') return true;
     return busy || contextItem.missing || (id === 'thumbnail' && generatingThumbnails);
+  }
+
+  async function relinkModel(item) {
+    const result = await action(() => window.nine.relinkModel(item.id));
+    if (!result?.items) return;
+    setSelectedId(item.id);
+    setPreviewRequestedId(null);
+    setMetadata(null);
+    setScadPreviewPhase('deferred');
+    notify('元ファイルを再指定した。タグ・メモ・プリセットを引き継いだ。');
   }
 
   async function runModelAction(id) {
@@ -162,6 +174,9 @@ export default function App() {
     switch (id) {
       case 'preview':
         selectModel(item, true);
+        break;
+      case 'relink':
+        await relinkModel(item);
         break;
       case 'thumbnail':
         await action(() => window.nine.generateThumbnail(item.id));
@@ -188,7 +203,7 @@ export default function App() {
     if (lightweightPreview && generatingThumbnails) setPreviewRequestedId(null);
   }, [lightweightPreview, generatingThumbnails]);
   useEffect(() => { setMetadata(null); setTagText((selected?.tags || []).join(', ')); setNotes(selected?.notes || ''); }, [selectedId]);
-  const title = section === 'favorites' ? 'お気に入り' : section === 'all' ? 'すべてのモデル' : shortPath(state.folders.find(f => f.id === section)?.path) || 'ライブラリ';
+  const title = section === 'favorites' ? 'お気に入り' : section === 'missing' ? 'ファイル不在' : section === 'all' ? 'すべてのモデル' : shortPath(state.folders.find(f => f.id === section)?.path) || 'ライブラリ';
   const totalSize = state.items.reduce((sum, i) => sum + i.size, 0);
   async function drop(e) {
     e.preventDefault(); setDragging(false);
@@ -212,6 +227,7 @@ export default function App() {
       <div className="nav-label">ライブラリ</div>
       <button className={`nav-item ${section === 'all' ? 'active' : ''}`} onClick={() => setSection('all')}><LayoutGrid size={18}/>すべてのモデル<span>{state.items.length}</span></button>
       <button className={`nav-item ${section === 'favorites' ? 'active' : ''}`} onClick={() => setSection('favorites')}><Heart size={18}/>お気に入り<span>{state.items.filter(i => i.favorite).length}</span></button>
+      <button className={`nav-item ${section === 'missing' ? 'active' : ''}`} onClick={() => setSection('missing')}><AlertCircle size={18}/>ファイル不在<span>{state.items.filter(i => i.missing).length}</span></button>
       <div className="nav-label folders-heading">監視フォルダ<button className="icon-button" title="監視フォルダを追加" onClick={addFolder}><Plus size={16}/></button></div>
       <div className="folder-list">{state.folders.map(folder => <button key={folder.id} title={folder.path} className={`nav-item folder-item ${section === folder.id ? 'active' : ''}`} onClick={() => setSection(folder.id)}><Folder size={17}/><span>{shortPath(folder.path)}</span><i className="watch-dot"/></button>)}</div>
       {!state.folders.length && <p className="folder-hint">フォルダを追加すると、<br/>新しいモデルを自動で登録。</p>}
@@ -265,7 +281,7 @@ export default function App() {
         </div>}</div><div className="viewer-footer"><span><MousePointer2 size={13}/>左ドラッグ: 回転 · 右: 移動 · ホイール: 拡大</span><span>mm</span></div></section>
         <aside className={scadItem ? "inspector scad-inspector" : "inspector"}><div className="inspector-title">モデル詳細<FileBox size={17}/></div><div className="inspector-scroll"><div className="detail-section"><label>ファイル名</label><h2>{selected.name}</h2><span className={`format-tag ${selected.format}`}>{formatName(selected.format)}</span><span className="detail-size">{formatSize(selected.size)}</span></div>
         {scadItem && <ScadPanel
-          key={scadItem.id + ":" + scadItem.modifiedAt}
+          key={`${scadItem.id}:${scadItem.path}:${scadItem.modifiedAt}`}
           item={scadItem}
           parametersInfo={scadItem.missing ? { parameters: [], selector: null, diagnostics: ["元ファイルが見つかりません。"] } : scad.parametersInfo}
           values={scad.values}
@@ -283,7 +299,11 @@ export default function App() {
         />}
         <div className="detail-section"><label>サイズ <span>mm</span></label><div className="dimensions">{['X','Y','Z'].map((axis,i) => <div key={axis}><span className={`axis-${axis}`}>{axis}</span><b>{metadata?.dimensions?.[i]?.toFixed(2) ?? '—'}</b></div>)}</div><div className="stat-row"><span>三角形</span><b>{metadata?.triangles?.toLocaleString() ?? '—'}</b></div><div className="stat-row"><span>メッシュ</span><b>{metadata?.objects?.toLocaleString() ?? '—'}</b></div>{metadata?.warnings?.map((warning,i) => <p className="model-warning" key={i}><AlertCircle size={13}/>{warning}</p>)}</div>
         <div className="detail-section"><label>タグ<Tag size={13}/></label><form onSubmit={e => { e.preventDefault(); action(() => window.nine.updateItem(selected.id,{ tags: [...new Set(tagText.split(/[,、]/).map(t => t.trim()).filter(Boolean))] }), 'タグを保存した'); }}><input className="detail-input" aria-label="タグ" placeholder="例: 治具, プリンタ" value={tagText} onChange={e => setTagText(e.target.value)}/><button className="text-button" type="submit">保存<Check size={13}/></button></form><label className="note-label">メモ</label><textarea className="detail-input" aria-label="メモ" placeholder="素材、用途、次に直すところ…" rows={3} value={notes} onChange={e => setNotes(e.target.value)}/><button className="text-button" onClick={() => action(() => window.nine.updateItem(selected.id,{notes}), 'メモを保存した')}>保存<Check size={13}/></button></div>
-        <div className="detail-section file-details"><label>保存場所</label><p title={selected.path}>{selected.path}</p><button className="text-button" onClick={() => action(() => window.nine.revealItem(selected.id))}><FolderOpen size={14}/>エクスプローラーで表示</button><div className="stat-row"><span>更新日</span><span>{date(selected.modifiedAt)}</span></div><button className="text-button remove-button" onClick={() => action(() => window.nine.removeItem(selected.id), '登録を解除した。元のファイルはそのまま。')}><Trash2 size={13}/>ライブラリから登録解除</button></div></div>
+        <div className="detail-section file-details"><label>保存場所</label><p title={selected.path}>{selected.path}</p>
+          {selected.missing
+            ? <button type="button" className="secondary-button" disabled={busy} onClick={() => relinkModel(selected)}><FolderOpen size={14}/>元ファイルを再指定</button>
+            : <button type="button" className="text-button" onClick={() => action(() => window.nine.revealItem(selected.id))}><FolderOpen size={14}/>エクスプローラーで表示</button>}
+          <div className="stat-row"><span>更新日</span><span>{date(selected.modifiedAt)}</span></div><button className="text-button remove-button" onClick={() => action(() => window.nine.removeItem(selected.id), '登録を解除した。元のファイルはそのまま。')}><Trash2 size={13}/>ライブラリから登録解除</button></div></div>
         <section className="bambu-action" aria-label="プリント">
           <button type="button" disabled={selected.missing || busy || printJob?.status === 'preparing' || (scadItem && !scadExecutable)} onClick={() => startPrint(selected)}><Box size={19}/><span>{printJob?.status === 'preparing' ? '印刷データを準備中…' : 'Bambu Studioで印刷準備'}</span><ArrowUpRight size={17}/></button>
           {printJob?.status === 'preparing' && <button type="button" className="bambu-cancel" onClick={() => window.nine.cancelBambuPrintPreparation().catch(error => notify(error.message, true))}>準備を中止</button>}

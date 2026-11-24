@@ -3,33 +3,29 @@ import { Cuboid } from 'lucide-react';
 
 export default function ModelThumbnail({ item, size = 64 }) {
   const anchor = useRef(null);
-  const [image, setImage] = useState(null);
+  const [visible, setVisible] = useState(false);
+  const [failedSource, setFailedSource] = useState(null);
   const { id, hasThumbnail, thumbnailRevision } = item;
 
   useEffect(() => {
-    if (!hasThumbnail) return;
-    let active = true;
-    const load = () => {
-      window.nine.getThumbnail(id, thumbnailRevision).then(source => {
-        if (active && source) setImage({ id, revision: thumbnailRevision, source });
-      }).catch(() => {});
-    };
+    if (visible || !hasThumbnail) return;
     if (!anchor.current || typeof IntersectionObserver === 'undefined') {
-      load();
-      return () => { active = false; };
+      setVisible(true);
+      return;
     }
     const observer = new IntersectionObserver(entries => {
       if (!entries.some(entry => entry.isIntersecting)) return;
       observer.disconnect();
-      load();
+      setVisible(true);
     });
     observer.observe(anchor.current);
-    return () => { active = false; observer.disconnect(); };
-  }, [id, hasThumbnail, thumbnailRevision]);
+    return () => observer.disconnect();
+  }, [visible, hasThumbnail]);
 
-  const source = hasThumbnail && image?.id === id && image.revision === thumbnailRevision ? image.source : null;
+  const source = visible && hasThumbnail && thumbnailRevision
+    ? `nine-thumb://library/${encodeURIComponent(id)}/${encodeURIComponent(thumbnailRevision)}` : null;
   return <div className="model-thumbnail" ref={anchor}>
-    {source ? <img src={source} alt="" decoding="async"/>
+    {source && source !== failedSource ? <img src={source} alt="" decoding="async" onError={() => setFailedSource(source)}/>
       : <div className="model-placeholder"><Cuboid strokeWidth={1} size={size}/></div>}
   </div>;
 }

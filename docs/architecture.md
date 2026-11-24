@@ -20,14 +20,16 @@ ModelViewer -> loadModel -> STL / STEP / 3MF adapters -> Three.js
                                |
                                + STEP: dedicated local WASM worker
 
-ThumbnailBatch -> one hidden BrowserWindow per item
+ThumbnailBatch -> one reusable hidden BrowserWindow during the run
     |                 | window.nineThumbnail (separate preload)
     |                 v
     |          src/thumbnail-worker.js -> same loadModel adapters
     v
-destroy worker -> validate source -> save image -> advance
+dispose job resources -> validate source -> save image -> advance
     |
     +-> SQLite thumbnail_batch_report (progress and result only)
+
+ModelThumbnail -> nine-thumb://library/<id>/<revision> -> SQLite BLOB
 ```
 
 `main.cjs` creates the normal window and handles native dialogs and application
@@ -55,8 +57,9 @@ loading.
 | Bambu Studio print handoff | `electron/bambu-print.cjs` | `tests/bambu-print.test.cjs` |
 | Native feature or new renderer capability | Guarded handler in `electron/main.cjs`, named API in `electron/preload.cjs` | Backend test plus actual IPC smoke |
 | Memory policy | `shared/preview-memory.json`, CJS/ESM policy helpers | `tests/preview-memory.test.mjs`, reader/adapter cases |
-| Thumbnail scheduling | `electron/thumbnail-batch.cjs`, main worker lifecycle | `tests/thumbnail-batch.test.cjs`, thumbnail smoke |
+| Thumbnail scheduling and renderer lifecycle | `electron/thumbnail-batch.cjs`, `electron/thumbnail-worker.cjs` | Batch/worker tests, thumbnail smoke |
 | Thumbnail image composition | `src/thumbnail-worker.js` | Nonblank-image checks in thumbnail smoke |
+| Thumbnail delivery | `electron/thumbnail-protocol.cjs`, `src/components/ModelThumbnail.jsx` | Protocol tests, thumbnail smoke |
 | Packaging or STEP runtime assets | `vite.config.js`, `scripts/copy-occt.mjs`, package build configuration | Build, package, packaged STEP/thumbnail smoke |
 
 ## Library state and persistence
@@ -69,8 +72,10 @@ under `system`; those fields are not part of the persisted library schema.
 
 SQLite uses row-level updates, transactions, foreign keys and WAL. Main retains a
 metadata projection for current UI filtering and file watches. Its snapshots
-contain thumbnail presence and revision only. Each visible card can fetch an
-individual thumbnail BLOB through a guarded call. The UI mounts 48 cards per page.
+contain thumbnail presence and revision only. The UI mounts 48 cards per page.
+Images request a single BLOB through `nine-thumb://library/<id>/<revision>`.
+The handler belongs to the main UI session; it accepts only a registered image
+ID and its current revision, and never opens a path provided by the request.
 
 The catalog persists:
 
@@ -81,11 +86,16 @@ The catalog persists:
 | `folders` | Watched folder records `{ id, path }` |
 | `settings` | Bambu/OpenSCAD paths, manual read budget, lightweight policy and unrelated inherited keys |
 | `excludedPaths` | Normalized paths suppressed after registration-only removal |
+| Model path bindings | Durable associations for relinked IDs and path hash collisions |
 
-IDs are a truncated SHA-256 of a resolved, case-folded path. Identical contents
-at different paths are separate entries. A rename or move produces a missing
-old entry and a separately registered new path. Do not change that identity
-rule without a migration plan.
+Existing registrations keep their IDs. An initial ID is normally a truncated
+SHA-256 of a normalized path. Later operations resolve the registered path
+through the path index, and confirmed relinks retain the original logical ID.
+Move detection marks the old path missing and may register the new path
+separately. Relink reuses the old ID, preserves its presets and metadata, and
+invalidates the cached image. It can remove a duplicate registration after
+confirmation only when the duplicate has no independent user data. Identical
+contents at different paths can still be registered separately.
 
 Mutations use a promise queue and publish only after committing. Initial
 conversion reads and validates the legacy JSON, commits the import as a unit and
@@ -170,14 +180,14 @@ library, independent of UI filters, with the memory budget captured at start.
 Existing thumbnails are skipped unless overwrite is requested; missing files are
 skipped. A single-item request regenerates that item even if an image exists.
 
-For every target, main creates a fresh hidden window with background throttling
-disabled. It returns one assigned model over guarded IPC. Once generation
-finishes, main destroys the worker window, validates source freshness, and awaits
-thumbnail persistence before proceeding. The 90-second timeout applies to
-generation, including reading/parsing/rendering; an atomic save already in
-progress is allowed to finish. Failure or renderer termination is recorded and
-the next target proceeds. Cancellation aborts/destroys the current generator and
-prevents the next target from starting.
+The worker keeps one hidden window and WebGL renderer during a healthy batch.
+Each assigned job has its own token and validated IPC. The worker disposes model
+and scene resources before it reports completion. Main checks source freshness
+and awaits image persistence before advancing. The 90-second timeout covers
+reading, parsing and rendering; an atomic save already in progress can finish.
+The window is dropped after cancellation, timeout or renderer failure, so a
+continuing batch gets a fresh window when needed. A normal malformed-model
+failure can proceed in the existing healthy window.
 
 `processed = succeeded + failed + skipped`; cancellation can leave it below
 `total`. Reports contain counts, scope, timestamps, the current item, and errors,

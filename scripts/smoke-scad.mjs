@@ -17,6 +17,7 @@ const outputs = ['current', 'specified', 'selected', 'all'].map(name => path.joi
 await Promise.all([data, models, ...outputs].map(directory => fs.mkdir(directory)));
 const original = await fs.readFile(path.join(root, 'tests/fixtures/customizable-parts.scad'));
 const source = path.join(models, 'customizable-parts.scad');
+const movedSource = path.join(models, 'relocated-parts.scad');
 const presetJson = path.join(temp, 'customizable-parts.json');
 const importJson = path.join(temp, 'additional-presets.json');
 await fs.writeFile(source, original);
@@ -47,9 +48,10 @@ try {
   const page = await app.firstWindow();
   assert.equal(await app.evaluate(({ app }) => app.getVersion()), JSON.parse(await fs.readFile(path.join(root, 'package.json'), 'utf8')).version, exe);
   await page.waitForFunction(() => window.nine?.getScadParameters);
-  await app.evaluate(({ dialog }, { folders, presetJson, importJson }) => {
+  await app.evaluate(({ dialog }, { folders, presetJson, importJson, movedSource }) => {
     dialog.showOpenDialog = async (_window, options) => {
       if (options.title === 'OpenSCADプリセットJSONを読み込む') return { canceled: false, filePaths: [importJson] };
+      if (options.title.includes('移動先のファイルを選択')) return { canceled: false, filePaths: [movedSource] };
       if (!options.properties.includes('openDirectory') || !folders.length) throw new Error('Unexpected folder dialog');
       return { canceled: false, filePaths: [folders.shift()] };
     };
@@ -57,7 +59,11 @@ try {
       if (options.title !== 'OpenSCADプリセットJSONの保存先') throw new Error('Unexpected save dialog');
       return { canceled: false, filePath: presetJson };
     };
-  }, { folders: outputs, presetJson, importJson });
+    dialog.showMessageBox = async (_window, options) => {
+      if (options.title !== '登録済みの移動先に再紐付け' || options.defaultId !== 0) throw new Error('Unexpected confirmation');
+      return { response: 1 };
+    };
+  }, { folders: outputs, presetJson, importJson, movedSource });
   const state = await page.evaluate(directory => window.nine.importPaths([directory]), models);
   assert(state.settings.openscadPath, 'Smoke test requires an installed OpenSCAD executable');
   assert.equal(state.items.find(item => item.name === 'customizable-parts.scad')?.format, 'scad');
@@ -141,7 +147,34 @@ try {
   assert.deepEqual(await fs.readFile(source), original);
   await info.scrollIntoViewIfNeeded();
   await page.screenshot({ path: path.join(out, 'openscad-export.png') });
-  console.log(JSON.stringify({ passed: true, packaged, previewWidth: 26, thumbnail: true, presets: 2, jsonRoundTrip: true, current: full.size, specified: specified.size, selected: selected.size, all: all.size, originalPreserved: true }));
+
+  const id = state.items.find(item => item.name === 'customizable-parts.scad').id;
+  await page.evaluate(modelId => window.nine.updateItem(modelId, { notes: 'Preserve this note', favorite: true, tags: ['fixture'] }), id);
+  await fs.rename(source, movedSource);
+  const afterMove = await page.evaluate(() => window.nine.rescan());
+  assert(afterMove.items.find(item => item.id === id).missing);
+  const duplicate = afterMove.items.find(item => item.name === 'relocated-parts.scad');
+  assert(duplicate && duplicate.id !== id, 'The watched folder should already have registered the new path');
+  await page.getByRole('button', { name: /^ファイル不在/ }).click();
+  await card.locator('.missing-badge').waitFor();
+  assert.equal(await page.getByRole('button', { name: 'モデル relocated-parts.scad', exact: true }).count(), 0);
+  await card.click({ button: 'right' });
+  await page.getByRole('menuitem', { name: '元ファイルを再指定', exact: true }).click();
+  await page.getByText('元ファイルを再指定した。タグ・メモ・プリセットを引き継いだ。', { exact: true }).waitFor({ timeout: 10000 });
+  const relinked = await page.evaluate(() => window.nine.getState());
+  const item = relinked.items.find(entry => entry.id === id);
+  assert.equal(item.path, movedSource);
+  assert.equal(item.missing, false);
+  assert.equal(item.favorite, true);
+  assert.deepEqual(item.tags, ['fixture']);
+  assert.equal(item.notes, 'Preserve this note');
+  assert(!relinked.items.some(entry => entry.id === duplicate.id));
+  assert.deepEqual(await fs.readFile(movedSource), original);
+  await savedPreset.selectOption({ label: 'Fixture Wide' });
+  await panel.getByRole('button', { name: '適用', exact: true }).click();
+  await panel.getByText(/編集欄に反映しました/).waitFor();
+  assert.equal(await width.inputValue(), '26');
+  console.log(JSON.stringify({ passed: true, packaged, previewWidth: 26, thumbnail: true, presets: 2, jsonRoundTrip: true, current: full.size, specified: specified.size, selected: selected.size, all: all.size, originalPreserved: true, watchedPathRelinked: true }));
 } finally {
   await app.close();
 }

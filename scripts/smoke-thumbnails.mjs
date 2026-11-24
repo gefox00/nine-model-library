@@ -46,6 +46,15 @@ async function waitForBatch(status, timeout = 180000) {
   return state;
 }
 
+const thumbnailUrl = item => `nine-thumb://library/${item.id}/${item.thumbnailRevision}`;
+
+async function readThumbnail(url) {
+  return application.evaluate(async ({ session }, resource) => {
+    const response = await session.fromPartition('nine-library-ui').fetch(resource, { cache: 'no-store' });
+    return { status: response.status, mime: response.headers.get('content-type'), bytes: Array.from(new Uint8Array(await response.arrayBuffer())) };
+  }, url);
+}
+
 async function monitorWorkers() {
   await application.evaluate(({ BrowserWindow }) => {
     const monitor = { max: 0, samples: 0, samplesWithWorker: 0, ids: new Set(), timer: null };
@@ -91,16 +100,29 @@ try {
   assert.equal(initial.failures.length, 1);
   assert.equal(initial.failures[0].name, 'bad.stl');
   assert(initial.failures[0].error.length > 0);
+  const initialReuse = await stopMonitor();
+  assert.equal(initialReuse.max, 1);
+  assert.equal(initialReuse.distinctWorkerWindows, 1, 'A healthy batch should reuse one renderer even when one model fails');
+  findings.push('One renderer generated three images and handled a malformed model in the same batch');
   findings.push('Default batch: 3 generated, 1 invalid STL failed, 2 skipped; processed 6/6');
 
   const generated = await page.evaluate(() => window.nine.getState());
-  assert.equal(await page.evaluate(id => window.nine.getThumbnail(id), existing.id), knownThumbnail);
+  let existingImage = generated.items.find(item => item.id === existing.id);
+  const originalUrl = thumbnailUrl(existingImage);
+  const keptImage = await readThumbnail(originalUrl);
+  assert.equal(keptImage.status, 200);
+  assert.deepEqual(Buffer.from(keptImage.bytes), Buffer.from(knownThumbnail.split(',')[1], 'base64'));
+  assert.equal(await page.evaluate(() => typeof window.nine.getThumbnail), 'undefined');
   assert(generated.items.every(item => !Object.hasOwn(item, 'thumbnail')));
   const imageChecks = [];
   for (const name of ['cube-mm.stl', 'cube-mm.step', 'cube-mm.3mf']) {
     const item = generated.items.find(candidate => candidate.name === name);
-    const thumbnail = await page.evaluate(id => window.nine.getThumbnail(id), item.id);
-    assert(item.hasThumbnail && thumbnail && thumbnail.length <= 250000, `${name}: thumbnail missing or too large`);
+    const imageUrl = thumbnailUrl(item);
+    const image = page.getByRole('button', { name: `モデル ${name}`, exact: true }).locator(`img[src="${imageUrl}"]`);
+    await image.scrollIntoViewIfNeeded();
+    assert.equal(await image.evaluate(async element => { await element.decode(); return element.naturalWidth; }), 480);
+    const { status, mime, bytes } = await readThumbnail(imageUrl);
+    assert(item.hasThumbnail && status === 200 && bytes.length > 0 && bytes.length <= 187500, `${name}: invalid binary thumbnail`);
     const check = await page.evaluate(async dataUrl => {
       const image = new Image();
       image.src = dataUrl;
@@ -113,20 +135,25 @@ try {
       let brightPixels = 0;
       for (let i = 0; i < pixels.length; i += 4) if (pixels[i] > 80 && pixels[i + 1] > 90 && pixels[i + 2] > 90) brightPixels++;
       return { width: image.naturalWidth, height: image.naturalHeight, brightPixels };
-    }, thumbnail);
+    }, `data:${mime};base64,${Buffer.from(bytes).toString('base64')}`);
     assert.deepEqual([check.width, check.height], [480, 360]);
     assert(check.brightPixels > 300, `${name}: model surface is not visible`);
-    const [, mime, content] = thumbnail.match(/^data:image\/(png|jpeg|webp);base64,(.+)$/);
-    await fs.writeFile(path.join(out, `thumb-${name.replaceAll('.', '-')}${packaged ? '-packaged' : ''}.${mime === 'jpeg' ? 'jpg' : mime}`), Buffer.from(content, 'base64'));
-    imageChecks.push({ name, ...check, dataUrlLength: thumbnail.length });
+    const format = mime.split('/')[1];
+    await fs.writeFile(path.join(out, `thumb-${name.replaceAll('.', '-')}${packaged ? '-packaged' : ''}.${format === 'jpeg' ? 'jpg' : format}`), Buffer.from(bytes));
+    imageChecks.push({ name, ...check, bytes: bytes.length });
   }
-  findings.push('STL, STEP/WASM via file://, and 3MF produced nonblank 480x360 images; existing Bambu thumbnail was preserved');
+  await page.evaluate(({ id, dataUrl }) => window.nine.saveThumbnail(id, dataUrl), { id: existing.id, dataUrl: knownThumbnail });
+  existingImage = (await page.evaluate(() => window.nine.getState())).items.find(item => item.id === existing.id);
+  assert.notEqual(thumbnailUrl(existingImage), originalUrl);
+  assert.equal((await readThumbnail(originalUrl)).status, 404, 'An obsolete revision should no longer be served');
+  findings.push('Binary protocol served nonblank 480x360 images in the library and rejected an obsolete revision');
   await page.screenshot({ path: path.join(out, `thumbnails-done${packaged ? '-packaged' : ''}.png`) });
   await page.getByRole('button', { name: /失敗 1 件の詳細/ }).click();
   await page.getByText('bad.stl', { exact: true }).last().waitFor();
   await page.screenshot({ path: path.join(out, `thumbnails-error-details${packaged ? '-packaged' : ''}.png`) });
   findings.push('Failure details expose the invalid STL filename and explanation in the UI');
 
+  await monitorWorkers();
   await page.getByLabel('サムネイル生成対象').selectOption('all');
   await page.getByRole('button', { name: 'サムネイル生成', exact: true }).click();
   await page.getByRole('button', { name: '生成を中止', exact: true }).click();
@@ -146,7 +173,7 @@ try {
   findings.push('Restarting missing-only generation after cancellation skipped all existing thumbnails and retried the invalid file');
   concurrency = await stopMonitor();
   assert.equal(concurrency.max, 1, 'At most one thumbnail renderer may be alive');
-  assert(concurrency.distinctWorkerWindows >= 4, 'Each model should use a fresh renderer');
+  assert(concurrency.distinctWorkerWindows <= 2, 'Only cancellation or batch boundaries may replace a renderer');
   findings.push(`10 ms main-process monitor observed ${concurrency.distinctWorkerWindows} separate worker windows, maximum concurrency ${concurrency.max}`);
 
   const beforeRestart = await page.evaluate(() => window.nine.getState());
@@ -159,11 +186,13 @@ try {
   assert.deepEqual(restoredBatch.failures, finalBatch.failures);
   assert.equal(restoredBatch.processed, finalBatch.processed);
   for (const item of beforeRestart.items) assert.equal(restoredLibrary.items.find(candidate => candidate.id === item.id)?.thumbnailRevision, item.thumbnailRevision);
-  assert.equal(await page.evaluate(id => window.nine.getThumbnail(id), existing.id), knownThumbnail);
+  const restoredImage = await readThumbnail(thumbnailUrl(restoredLibrary.items.find(item => item.id === existing.id)));
+  assert.equal(restoredImage.status, 200);
+  assert.deepEqual(Buffer.from(restoredImage.bytes), Buffer.from(knownThumbnail.split(',')[1], 'base64'));
   findings.push('Saved thumbnails and last batch result survived a complete app restart');
   assert.deepEqual(pageErrors, []);
   succeeded = true;
-  const report = { passed: true, packaged, findings, imageChecks, concurrency, initial, cancelled, finalBatch, pageErrors, testDir };
+  const report = { passed: true, packaged, findings, imageChecks, initialReuse, concurrency, initial, cancelled, finalBatch, pageErrors, testDir };
   await fs.writeFile(path.join(out, `thumbnails-smoke${packaged ? '-packaged' : ''}-result.json`), JSON.stringify(report, null, 2));
   console.log(JSON.stringify(report, null, 2));
 } catch (error) {

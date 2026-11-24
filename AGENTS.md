@@ -30,13 +30,17 @@ Keep changes focused on the requested behavior and preserve existing library dat
   changes before updating the in-memory catalog. A schema migration must preserve
   settings, tags, notes, favorites, and exclusions, and retain the legacy JSON.
   Never replace a corrupt library with an empty one or silently roll back to JSON.
-- Item IDs identify normalized file paths, not file contents. Registration does
-  not relocate source files. Updating geometry invalidates its cached thumbnail.
+- Item IDs identify logical registrations. A confirmed relink updates the path
+  without changing the ID, presets or user metadata. Normalized path mappings
+  must prevent a new file at an old path from taking over its ID. Registration
+  does not relocate files. A geometry update or relink invalidates the image.
   Removing a watch folder keeps its registered items.
 - Single and bulk thumbnail requests share one queue and one concurrency gate.
-  Keep one fresh hidden renderer per model, terminate it on cancellation/timeout,
-  await image persistence before starting the next model, and validate source
-  freshness before saving. Do not include image bytes in batch reports.
+  Reuse one hidden renderer within a batch, dispose job resources before reuse,
+  and discard the window on cancellation, timeout or renderer failure. Validate
+  the sender, frame and job token, and await image persistence before advancing.
+  Cache images are served as BLOB bytes by revision to the main UI session only.
+  Do not include image bytes in catalog snapshots or batch reports.
 - Copy uses `COPYFILE_EXCL`; never silently overwrite a destination. Trash uses a
   native confirmation with Cancel as the default, revalidates the captured source,
   and calls `shell.trashItem` with no permanent-delete fallback. Registration-only

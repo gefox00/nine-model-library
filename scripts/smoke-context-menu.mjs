@@ -84,7 +84,8 @@ try {
   const registered = await page.evaluate(() => window.nine.getState());
   const stepped = registered.items.find(item => item.name === path.basename(step));
   assert.equal(stepped.hasThumbnail, true);
-  assert.match(await page.evaluate(id => window.nine.getThumbnail(id), stepped.id), /^data:image\//);
+  const stepImage = card(step).locator(`img[src="nine-thumb://library/${stepped.id}/${stepped.thumbnailRevision}"]`);
+  assert.equal(await stepImage.evaluate(async image => { await image.decode(); return image.naturalWidth; }), 480);
   assert.equal(registered.items.find(item => item.name === path.basename(stl)).hasThumbnail, false);
   assert(registered.items.every(item => !Object.hasOwn(item, 'thumbnail')));
 

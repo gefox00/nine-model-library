@@ -18,7 +18,8 @@ const isInside = (target, directory) => normalize(target) === normalize(director
 const formatFor = file => formatByExtension.get(path.extname(file).slice(1).toLowerCase());
 const freshData = () => ({ items: [], folders: [], settings: { bambuPath: '', openscadPath: '',
   memoryBudgetMiB: normalizeMemoryBudget(undefined), lightweightPreview: true }, excludedPaths: [] });
-const newChanges = () => ({ models: new Map(), folders: new Map(), settings: new Map(), excludedPaths: new Map(), thumbnails: new Map() });
+const newChanges = () => ({ models: new Map(), folders: new Map(), settings: new Map(), excludedPaths: new Map(),
+  thumbnails: new Map(), pathAliases: new Map(), newIdsByPath: new Map() });
 
 function normalizedSettings(settings) {
   const result = { ...freshData().settings, ...settings };
@@ -56,6 +57,9 @@ class Library extends EventEmitter {
     this.file = path.join(this.dataDir, 'library.sqlite3');
     this.data = freshData();
     this.itemsById = new Map();
+    this.itemIdsByPath = new Map();
+    this.pathAliases = new Map();
+    this.aliasPathsById = new Map();
     this.excluded = new Set();
     this.status = { scanning: false, message: '' };
     this.watchers = [];
@@ -78,6 +82,17 @@ class Library extends EventEmitter {
       this.store = store;
       this.data = this.store.load();
       this.itemsById = new Map(this.data.items.map(item => [item.id, item]));
+      this.itemIdsByPath = new Map(this.data.items.map(item => [normalize(item.path), item.id]));
+      this.pathAliases = this.store.readPathAliases();
+      this.aliasPathsById = new Map([...this.pathAliases].map(([key, id]) => [id, key]));
+      if (this.itemIdsByPath.size !== this.data.items.length ||
+          [...this.pathAliases].some(([key, id]) => {
+            const activeId = this.itemIdsByPath.get(key);
+            const activePath = this.itemsById.get(id)?.path;
+            return (activeId && activeId !== id) || (activePath && normalize(activePath) !== key);
+          })) {
+        throw new Error('ライブラリに重複または矛盾するパス登録があります');
+      }
       this.excluded = new Set(this.data.excludedPaths);
       const changes = newChanges();
       const settings = normalizedSettings(this.data.settings);
@@ -139,12 +154,17 @@ class Library extends EventEmitter {
     return result;
   }
 
-  apply(changes, { notify = true } = {}) {
+  apply(changes, { notify = true, relinkTargetId } = {}) {
     if (!Object.values(changes).some(rows => rows.size)) return;
-    this.store.apply(changes);
+    this.store.apply(changes, { relinkTargetId });
     let removedModel = false;
     for (const [id, model] of changes.models) {
       const stored = this.itemsById.get(id);
+      const previousKey = stored && normalize(stored.path);
+      const currentKey = model && normalize(model.path);
+      if (previousKey && previousKey !== currentKey && this.itemIdsByPath.get(previousKey) === id) {
+        this.itemIdsByPath.delete(previousKey);
+      }
       if (!model) {
         removedModel = this.itemsById.delete(id) || removedModel;
       } else if (stored) {
@@ -153,6 +173,7 @@ class Library extends EventEmitter {
         this.itemsById.set(id, model);
         this.data.items.push(model);
       }
+      if (currentKey) this.itemIdsByPath.set(currentKey, id);
     }
     if (removedModel) this.data.items = this.data.items.filter(model => this.itemsById.has(model.id));
     if (changes.folders.size) {
@@ -166,6 +187,16 @@ class Library extends EventEmitter {
         else this.excluded.delete(key);
       }
       this.data.excludedPaths = [...this.excluded];
+    }
+    for (const key of changes.pathAliases.keys()) {
+      const oldId = this.pathAliases.get(key);
+      if (oldId) this.aliasPathsById.delete(oldId);
+      this.pathAliases.delete(key);
+    }
+    for (const [key, id] of changes.pathAliases) {
+      if (!id) continue;
+      this.pathAliases.set(key, id);
+      this.aliasPathsById.set(id, key);
     }
     for (const [id, image] of changes.thumbnails) {
       const model = this.itemsById.get(id);
@@ -195,6 +226,19 @@ class Library extends EventEmitter {
     return isInside(file, this.dataDir) || /(?:^|[\\/])(?:node_modules|\.git|\.svn)(?:[\\/]|$)/.test(file);
   }
 
+  modelForPath(key, changes) {
+    const id = changes?.newIdsByPath.get(key) ?? this.itemIdsByPath.get(key);
+    return changes?.models.has(id) ? changes.models.get(id) : this.itemsById.get(id);
+  }
+
+  reservedModelId(key, changes) {
+    const alias = this.pathAliases.get(key);
+    if (alias) return alias;
+    const derived = idFor(key);
+    if (this.itemsById.has(derived) || this.aliasPathsById.has(derived) || changes?.models.has(derived)) return null;
+    return derived;
+  }
+
   async upsert(file, changes, { explicit = false } = {}) {
     const absolute = path.resolve(file);
     const format = formatFor(absolute);
@@ -207,10 +251,10 @@ class Library extends EventEmitter {
     catch (error) { if (error.code === 'ENOENT') return this.markMissing(absolute, changes); throw error; }
     if (!stat.isFile()) return this.markMissing(absolute, changes);
     if (excluded) changes.excludedPaths.set(key, false);
-    const id = idFor(absolute);
-    const previous = changes.models.get(id) ?? this.itemsById.get(id);
+    const previous = this.modelForPath(key, changes);
     const modifiedAt = stat.mtime.toISOString();
     if (previous) {
+      const { id } = previous;
       const changed = previous.modifiedAt !== modifiedAt || previous.size !== stat.size || previous.missing;
       if (changed) {
         changes.models.set(id, { ...previous, name: path.basename(absolute), path: absolute, format, size: stat.size, modifiedAt, missing: false });
@@ -218,14 +262,21 @@ class Library extends EventEmitter {
       }
       return;
     }
+    let id = this.reservedModelId(key, changes);
+    if (!id) {
+      // A moved model may still own the ID originally derived from this path.
+      do { id = crypto.randomBytes(12).toString('hex'); }
+      while (this.itemsById.has(id) || this.aliasPathsById.has(id) || changes.models.has(id));
+      changes.pathAliases.set(key, id);
+    }
+    changes.newIdsByPath.set(key, id);
     changes.models.set(id, { id, name: path.basename(absolute), path: absolute, format, size: stat.size, modifiedAt,
       addedAt: new Date().toISOString(), missing: false, favorite: false, tags: [], notes: '', hasThumbnail: false, thumbnailRevision: null });
   }
 
   markMissing(file, changes) {
-    const id = idFor(file);
-    const item = changes.models.get(id) ?? this.itemsById.get(id);
-    if (item && !item.missing) changes.models.set(id, { ...item, missing: true });
+    const item = this.modelForPath(normalize(file), changes);
+    if (item && !item.missing) changes.models.set(item.id, { ...item, missing: true });
   }
 
   async walk(directory, changes, visitedFiles, visitedFolders) {
@@ -389,6 +440,78 @@ class Library extends EventEmitter {
     return item;
   }
 
+  async captureRelinkSource(id) {
+    const item = this.item(id);
+    const source = { path: item.path, name: item.name, format: item.format, addedAt: item.addedAt };
+    await this.assertRelinkSourceMissing(id, source);
+    return source;
+  }
+
+  async assertRelinkSourceMissing(id, expected) {
+    const unchanged = () => {
+      const item = this.item(id);
+      return item.missing && item.path === expected?.path && item.addedAt === expected?.addedAt;
+    };
+    if (!unchanged()) throw new Error('不在のモデルを選び直してください');
+    try { await fs.lstat(expected.path); }
+    catch (error) {
+      // Permission or connectivity errors do not prove that a file is absent.
+      if (!['ENOENT', 'ENOTDIR'].includes(error.code)) throw new Error('元の場所を確認できません。再紐付けは中止しました');
+      if (!unchanged()) throw new Error('元の登録情報が変わりました。モデルを選び直してください');
+      return;
+    }
+    throw new Error('元の場所にファイルが見つかりました。先にライブラリを再スキャンしてください');
+  }
+
+  async inspectRelinkTarget(id, file, source) {
+    if (typeof file !== 'string' || !path.isAbsolute(file) || this.ignored(file) ||
+        formatFor(file) !== source.format || normalize(file) === normalize(source.path)) {
+      throw new Error('対応する同じ形式の移動先ファイルを選んでください');
+    }
+    const absolute = path.resolve(file);
+    const key = normalize(absolute);
+    let stat;
+    try {
+      if (!(await fs.lstat(absolute)).isFile()) throw new Error('not a regular file');
+      const handle = await fs.open(absolute, 'r');
+      try { stat = await handle.stat(); }
+      finally { await handle.close(); }
+      if (!stat.isFile()) throw new Error('not a regular file');
+    } catch {
+      throw new Error('移動先のファイルが見つからないか、読み取れません');
+    }
+    await this.assertRelinkSourceMissing(id, source);
+    const existing = this.modelForPath(key);
+    const targetId = existing?.id ?? this.reservedModelId(key);
+    // A path can have presets even when its library row was unregistered.
+    if (targetId && targetId !== id) this.store.assertRelinkTargetReusable(targetId);
+    return { path: absolute, size: stat.size, modifiedAt: stat.mtime.toISOString(),
+      identity: [stat.dev, stat.ino, stat.birthtimeMs, stat.mtimeMs, stat.size].join(':'),
+      existing: existing ? { id: existing.id, addedAt: existing.addedAt } : null, targetId };
+  }
+
+  relinkModel(id, file, source, confirmed) {
+    return this.enqueue(async () => {
+      const target = await this.inspectRelinkTarget(id, file, source);
+      if (!confirmed || target.path !== confirmed.path || target.identity !== confirmed.identity ||
+          target.targetId !== confirmed.targetId || target.existing?.id !== confirmed.existing?.id ||
+          target.existing?.addedAt !== confirmed.existing?.addedAt) {
+        throw new Error('移動先のファイルまたは登録が変わりました。選び直してください');
+      }
+      const item = this.item(id);
+      const changes = newChanges();
+      if (target.existing) changes.models.set(target.existing.id, null);
+      changes.models.set(id, { ...item, name: path.basename(target.path), path: target.path,
+        size: target.size, modifiedAt: target.modifiedAt, missing: false });
+      if (item.hasThumbnail) changes.thumbnails.set(id, null);
+      changes.pathAliases.set(normalize(item.path), null);
+      changes.pathAliases.set(normalize(target.path), id);
+      if (this.excluded.has(normalize(target.path))) changes.excludedPaths.set(normalize(target.path), false);
+      this.apply(changes, { relinkTargetId: target.targetId });
+      return this.getState();
+    });
+  }
+
   updateItem(id, patch) {
     return this.enqueue(() => {
       const item = { ...this.item(id) };
@@ -523,9 +646,11 @@ class Library extends EventEmitter {
         typeof expectedSource.modifiedAt !== 'string' || !Number.isFinite(expectedSource.size)) {
       throw new Error('元ファイル情報が不正です');
     }
-    if (item.missing || normalize(item.path) !== normalize(expectedSource.path) ||
-        item.size !== expectedSource.size || item.modifiedAt !== expectedSource.modifiedAt ||
-        (expectedSource.addedAt !== undefined && item.addedAt !== expectedSource.addedAt)) {
+    const expectedPath = normalize(expectedSource.path);
+    const sourceMatches = current => !current.missing && normalize(current.path) === expectedPath &&
+      current.size === expectedSource.size && current.modifiedAt === expectedSource.modifiedAt &&
+      (expectedSource.addedAt === undefined || current.addedAt === expectedSource.addedAt);
+    if (!sourceMatches(item)) {
       throw new Error(`元ファイルまたは登録情報が更新されたため、${operation}を中止しました`);
     }
     const stat = await fs.stat(item.path).catch(() => { throw new Error(`元ファイルが見つからないため、${operation}を中止しました`); });
@@ -537,7 +662,8 @@ class Library extends EventEmitter {
       throw new Error(`元ファイルが別のファイルに置き換わったため、${operation}を中止しました`);
     }
     // Re-check registration after the asynchronous stat when called outside the save queue.
-    if (this.item(id) !== item) throw new Error('ライブラリの登録が変更されました');
+    const current = this.item(id);
+    if (current !== item || !sourceMatches(current)) throw new Error('ライブラリの登録が変更されました');
     return item;
   }
 
@@ -555,11 +681,11 @@ class Library extends EventEmitter {
     });
   }
 
-  readThumbnail(id, revision) {
+  readThumbnailImage(id, revision) {
     if (this.closed || typeof id !== 'string') return null;
     const item = this.itemsById.get(id);
     if (!item?.hasThumbnail || (revision !== undefined && revision !== item.thumbnailRevision)) return null;
-    return this.store.readThumbnail(id, revision);
+    return this.store.readThumbnailImage(id, item.thumbnailRevision);
   }
 
   setBambu(file) {

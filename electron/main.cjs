@@ -1,20 +1,23 @@
-const { app, BrowserWindow, ipcMain, dialog, shell } = require('electron');
+const { app, BrowserWindow, ipcMain, dialog, shell, protocol, session } = require('electron');
 const path = require('node:path');
 const fs = require('node:fs/promises');
 const { Library } = require('./library.cjs');
+const { chooseRelinkModel } = require('./model-relink-dialog.cjs');
 const { BambuPrint } = require('./bambu-print.cjs');
 const { ThumbnailBatch, abortError } = require('./thumbnail-batch.cjs');
+const { ThumbnailWorker } = require('./thumbnail-worker.cjs');
 const scad = require('./scad-engine.cjs');
 const { ScadPresets, readCustomizerJson, writeCustomizerJson } = require('./scad-presets.cjs');
 const formats = require('../shared/formats.json');
 const { assertMemoryBudget, effectivePreviewBudget } = require('../shared/preview-memory.cjs');
+const { THUMBNAIL_SCHEME, LIBRARY_SESSION, thumbnailRequestHandler } = require('./thumbnail-protocol.cjs');
 
 app.setName('Nine Model Library');
+protocol.registerSchemesAsPrivileged([{ scheme: THUMBNAIL_SCHEME, privileges: { standard: true } }]);
 let library;
 let mainWindow;
 let thumbnailBatch;
 let bambuPrint;
-let activeThumbnailWorker = null;
 let activeModelRead = null;
 const scadRenders = new Map();
 let scadExport = null;
@@ -43,6 +46,8 @@ function handle(name, callback) {
 async function boot() {
   library = new Library(app.getPath('userData'));
   await library.init({ backgroundScan: true });
+  session.fromPartition(LIBRARY_SESSION).protocol.handle(THUMBNAIL_SCHEME,
+    thumbnailRequestHandler((id, revision) => library.readThumbnailImage(id, revision)));
   bambuPrint = new BambuPrint({
     getExecutable: () => library.data.settings.bambuPath,
     getOpenScad: () => library.data.settings.openscadPath,
@@ -63,12 +68,29 @@ async function boot() {
   const readBatchReport = library.database.prepare('SELECT report_json FROM thumbnail_batch_report WHERE id = 1');
   const saveBatchReport = library.database.prepare(`INSERT INTO thumbnail_batch_report (id, report_json) VALUES (1, ?)
     ON CONFLICT (id) DO UPDATE SET report_json = excluded.report_json`);
+  const thumbnailWorker = new ThumbnailWorker({
+    createWindow: () => new BrowserWindow({
+      width: 512, height: 512, show: false, skipTaskbar: true, focusable: false,
+      backgroundColor: '#101820', autoHideMenuBar: true,
+      webPreferences: { preload: path.join(__dirname, 'thumbnail-preload.cjs'), nodeIntegration: false,
+        contextIsolation: true, sandbox: true, webSecurity: true, backgroundThrottling: false },
+    }),
+    loadWindow: worker => {
+      const devUrl = process.env.VITE_DEV_SERVER_URL;
+      return devUrl && !app.isPackaged
+        ? worker.loadURL(new URL('thumbnail.html', devUrl.endsWith('/') ? devUrl : `${devUrl}/`).href)
+        : worker.loadFile(path.join(__dirname, '../dist/thumbnail.html'));
+    },
+    readInput: readThumbnailInput,
+  });
+  thumbnailWorker.registerIpc(ipcMain);
   thumbnailBatch = new ThumbnailBatch({
-    generate: generateThumbnail,
+    generate: (item, options) => thumbnailWorker.generate(item, options),
     saveThumbnail: (item, result, { signal }) => library.saveThumbnail(item.id, result.dataUrl, item, { signal }),
     persistReport: async report => { saveBatchReport.run(JSON.stringify(report)); },
   });
   thumbnailBatch.on('state', state => {
+    if (state.status !== 'running') thumbnailWorker.close();
     if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('nine:thumbnail-batch', state);
   });
   try {
@@ -78,9 +100,7 @@ async function boot() {
   catch (error) {
     if (error.code !== 'ENOENT') thumbnailBatch.state.reportError = `前回の生成結果を読み込めません: ${error.message}`;
   }
-  registerThumbnailWorkerIpc();
   handle('getState', () => library.getState());
-  handle('getThumbnail', (id, revision) => library.readThumbnail(id, revision));
   handle('addFiles', async () => {
     const result = await dialog.showOpenDialog(mainWindow, { title: '3Dファイルを登録', properties: ['openFile', 'multiSelections'], filters: [
       { name: '3Dモデル', extensions: formats.flatMap(format => format.extensions) },
@@ -96,6 +116,7 @@ async function boot() {
   handle('rescan', () => library.rescan());
   handle('updateItem', (id, patch) => library.updateItem(id, patch));
   handle('removeItem', id => library.removeItem(id));
+  handle('relinkModel', id => chooseRelinkModel(library, dialog, mainWindow, id));
   handle('copyModel', async id => {
     const source = await library.captureFileSource(id);
     const result = await dialog.showOpenDialog(mainWindow, {
@@ -341,7 +362,8 @@ function createWindow() {
   mainWindow = new BrowserWindow({
     title: 'Nine Model Library', width: 1520, height: 960, minWidth: 1100, minHeight: 720,
     backgroundColor: '#0b1015', autoHideMenuBar: true, show: false,
-    webPreferences: { preload: path.join(__dirname, 'preload.cjs'), nodeIntegration: false, contextIsolation: true, sandbox: true, webSecurity: true },
+    webPreferences: { preload: path.join(__dirname, 'preload.cjs'), partition: LIBRARY_SESSION,
+      nodeIntegration: false, contextIsolation: true, sandbox: true, webSecurity: true },
   });
   mainWindow.removeMenu();
   mainWindow.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
@@ -353,89 +375,16 @@ function createWindow() {
   else mainWindow.loadFile(path.join(__dirname, '../dist/index.html'));
 }
 
-function authenticateThumbnailWorker(event) {
-  const task = activeThumbnailWorker;
-  if (!task || !task.window || task.window.isDestroyed() || event.sender !== task.window.webContents ||
-      event.senderFrame !== task.window.webContents.mainFrame || task.signal.aborted ||
-      thumbnailBatch.getState().status !== 'running') throw new Error('許可されていないサムネイル処理です');
-  return task;
-}
-
-function registerThumbnailWorkerIpc() {
-  ipcMain.handle('nine-thumb:input', async event => {
-    const task = authenticateThumbnailWorker(event);
-    if (task.inputRequested) throw new Error('モデルはすでに読み込み済みです');
-    task.inputRequested = true;
-    await library.assertThumbnailSource(task.item.id, task.item);
-    let bytes;
-    let displayItem = task.item;
-    if (task.item.format === 'scad') {
-      const rendered = await scad.renderScad({ executable: library.data.settings.openscadPath, sourcePath: task.item.path,
-        values: {}, memoryBudgetMiB: task.memoryBudgetMiB, signal: task.signal });
-      bytes = rendered.bytes;
-      displayItem = { ...task.item, format: 'stl', name: `${path.basename(task.item.name, path.extname(task.item.name))}.stl` };
-    } else bytes = await library.readModel(task.item.id, { memoryBudgetMiB: task.memoryBudgetMiB, signal: task.signal });
-    task.signal.throwIfAborted();
-    if (activeThumbnailWorker !== task) throw abortError();
-    return { item: displayItem, bytes, memoryBudgetMiB: task.memoryBudgetMiB };
-  });
-  ipcMain.handle('nine-thumb:complete', (event, result) => {
-    const task = authenticateThumbnailWorker(event);
-    if (!task.inputRequested || !result || typeof result.dataUrl !== 'string' || result.dataUrl.length > 250000 ||
-        !/^data:image\/(?:png|jpeg|webp);base64,[a-zA-Z0-9+/=]+$/.test(result.dataUrl)) {
-      throw new Error('生成したサムネイルが不正です');
-    }
-    task.finish(null, { dataUrl: result.dataUrl });
-    return true;
-  });
-  ipcMain.handle('nine-thumb:fail', (event, message) => {
-    const task = authenticateThumbnailWorker(event);
-    task.finish(new Error(String(message || 'サムネイルを生成できませんでした').slice(0, 4000)));
-    return true;
-  });
-}
-
-function generateThumbnail(item, { memoryBudgetMiB, signal }) {
-  return new Promise((resolve, reject) => {
-    if (signal.aborted) { reject(signal.reason || abortError()); return; }
-    if (activeThumbnailWorker) { reject(new Error('前のサムネイル処理が終了していません')); return; }
-    let settled = false;
-    const task = { item, memoryBudgetMiB, signal, window: null, inputRequested: false };
-    const abort = () => task.finish(signal.reason || abortError());
-    task.finish = (error, result) => {
-      if (settled) return;
-      settled = true;
-      signal.removeEventListener('abort', abort);
-      if (activeThumbnailWorker === task) activeThumbnailWorker = null;
-      if (task.window && !task.window.isDestroyed()) task.window.destroy();
-      if (error) reject(error); else resolve(result);
-    };
-    activeThumbnailWorker = task;
-    signal.addEventListener('abort', abort, { once: true });
-    try {
-      const worker = new BrowserWindow({
-        width: 512, height: 512, show: false, skipTaskbar: true, focusable: false,
-        backgroundColor: '#101820', autoHideMenuBar: true,
-        webPreferences: { preload: path.join(__dirname, 'thumbnail-preload.cjs'), nodeIntegration: false,
-          contextIsolation: true, sandbox: true, webSecurity: true, backgroundThrottling: false },
-      });
-      task.window = worker;
-      worker.removeMenu();
-      worker.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
-      worker.webContents.on('will-navigate', event => event.preventDefault());
-      worker.webContents.on('render-process-gone', (_event, details) => {
-        task.finish(new Error(`生成用プロセスが終了しました（${details.reason}）`));
-      });
-      worker.webContents.on('did-fail-load', (_event, code, description, _url, isMainFrame) => {
-        if (isMainFrame && code !== -3) task.finish(new Error(`生成画面を読み込めません: ${description}`));
-      });
-      worker.on('closed', () => task.finish(new Error('生成用ウィンドウが閉じられました')));
-      const load = process.env.VITE_DEV_SERVER_URL && !app.isPackaged
-        ? worker.loadURL(new URL('thumbnail.html', process.env.VITE_DEV_SERVER_URL.endsWith('/') ? process.env.VITE_DEV_SERVER_URL : `${process.env.VITE_DEV_SERVER_URL}/`).href)
-        : worker.loadFile(path.join(__dirname, '../dist/thumbnail.html'));
-      load.catch(error => task.finish(error));
-    } catch (error) { task.finish(error); }
-  });
+async function readThumbnailInput(item, { memoryBudgetMiB, signal }) {
+  await library.assertThumbnailSource(item.id, item);
+  if (item.format === 'scad') {
+    const { bytes } = await scad.renderScad({ executable: library.data.settings.openscadPath, sourcePath: item.path,
+      values: {}, memoryBudgetMiB, signal });
+    const name = `${path.basename(item.name, path.extname(item.name))}.stl`;
+    return { name, bytes, memoryBudgetMiB };
+  }
+  const bytes = await library.readModel(item.id, { memoryBudgetMiB, signal });
+  return { name: item.name, bytes, memoryBudgetMiB };
 }
 
 app.on('window-all-closed', () => { if (process.platform !== 'darwin') app.quit(); });

@@ -3,13 +3,13 @@ const invoke = (method, ...args) => ipcRenderer.invoke(`nine:${method}`, ...args
 
 contextBridge.exposeInMainWorld('nine', {
   getState: () => invoke('getState'),
-  getThumbnail: (id, revision) => invoke('getThumbnail', id, revision),
   addFiles: () => invoke('addFiles'),
   addFolder: () => invoke('addFolder'),
   removeFolder: id => invoke('removeFolder', id),
   rescan: () => invoke('rescan'),
   updateItem: (id, patch) => invoke('updateItem', id, patch),
   removeItem: id => invoke('removeItem', id),
+  relinkModel: id => invoke('relinkModel', id),
   copyModel: id => invoke('copyModel', id),
   trashModel: id => invoke('trashModel', id),
   readModel: (id, options, requestId) => invoke('readModel', id, options, requestId),

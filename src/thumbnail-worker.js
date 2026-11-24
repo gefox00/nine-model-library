@@ -5,10 +5,9 @@ const WIDTH = 480;
 const HEIGHT = 360;
 const BACKGROUND = '#141b25';
 const MAX_DATA_URL_LENGTH = 250000;
-const controller = new AbortController();
 const api = window.nineThumbnail;
-let reportedFailure = false;
-let completed = false;
+let currentJob = null;
+let renderer = null;
 
 function encodeThumbnail(canvas) {
   const png = canvas.toDataURL('image/png');
@@ -22,6 +21,7 @@ function encodeThumbnail(canvas) {
 
 async function resizeSavedPreview(source, signal) {
   const image = new Image();
+  let canvas;
   try {
     await new Promise((resolve, reject) => {
       const onAbort = () => {
@@ -41,7 +41,7 @@ async function resizeSavedPreview(source, signal) {
       image.src = source;
     });
     if (!image.naturalWidth || !image.naturalHeight) throw new Error('プレビュー画像のサイズが不正です');
-    const canvas = document.createElement('canvas');
+    canvas = document.createElement('canvas');
     canvas.width = WIDTH;
     canvas.height = HEIGHT;
     const context = canvas.getContext('2d');
@@ -57,6 +57,7 @@ async function resizeSavedPreview(source, signal) {
     image.onload = null;
     image.onerror = null;
     image.src = '';
+    if (canvas) canvas.width = canvas.height = 0;
   }
 }
 
@@ -105,21 +106,17 @@ function renderModel(object, scene, renderer) {
   return encodeThumbnail(renderer.domElement);
 }
 
-async function generateThumbnail(input) {
-  if (!input?.item?.name || !input.bytes) throw new Error('サムネイル生成の入力データが不正です');
-  let result;
-  let renderer;
-  let scene;
-  try {
-    result = await loadModel(input.bytes, {
-      filename: input.item.name,
-      memoryBudgetMiB: input.memoryBudgetMiB ?? 2048,
-      signal: controller.signal,
-    });
-    if (!result.object && result.previewImage) {
-      return { dataUrl: await resizeSavedPreview(result.previewImage, controller.signal), warnings: result.warnings || [] };
-    }
-    if (!result.object) throw new Error('モデルに形状もプレビュー画像も含まれていません');
+function disposeRenderer() {
+  if (!renderer) return;
+  renderer.dispose();
+  renderer.forceContextLoss();
+  renderer.domElement.remove();
+  renderer = null;
+}
+
+function getRenderer() {
+  if (renderer?.getContext().isContextLost()) disposeRenderer();
+  if (!renderer) {
     renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false, preserveDrawingBuffer: true });
     renderer.setPixelRatio(1);
     renderer.setSize(WIDTH, HEIGHT, false);
@@ -128,54 +125,88 @@ async function generateThumbnail(input) {
     renderer.toneMapping = THREE.ACESFilmicToneMapping;
     renderer.toneMappingExposure = 1.15;
     document.body.appendChild(renderer.domElement);
-    scene = new THREE.Scene();
-    return { dataUrl: renderModel(result.object, scene, renderer), warnings: result.warnings || [] };
-  } finally {
-    // Free model resources before acknowledging completion; main may destroy the
-    // window as soon as it has persisted the result.
-    if (scene) disposeModel(scene);
-    if (result?.object && !result.object.parent) disposeModel(result.object);
-    if (renderer) {
-      renderer.dispose();
-      renderer.forceContextLoss();
-      renderer.domElement.remove();
+  }
+  return renderer;
+}
+
+async function generateThumbnail(input, signal) {
+  if (!input?.name || !input.bytes) throw new Error('サムネイル生成の入力データが不正です');
+  let result;
+  let scene;
+  let jobRenderer;
+  try {
+    result = await loadModel(input.bytes, {
+      filename: input.name,
+      memoryBudgetMiB: input.memoryBudgetMiB ?? 2048,
+      signal,
+    });
+    signal.throwIfAborted();
+    if (!result.object && result.previewImage) {
+      return { dataUrl: await resizeSavedPreview(result.previewImage, signal) };
     }
+    if (!result.object) throw new Error('モデルに形状もプレビュー画像も含まれていません');
+    jobRenderer = getRenderer();
+    scene = new THREE.Scene();
+    return { dataUrl: renderModel(result.object, scene, jobRenderer) };
+  } finally {
+    // The canvas and context are reused. Model and render-list resources are
+    // released before the next thumbnail job is issued.
+    if (scene) {
+      disposeModel(scene);
+      scene.clear();
+    }
+    if (result?.object && !result.object.parent) disposeModel(result.object);
+    jobRenderer?.renderLists.dispose();
+    if (jobRenderer?.getContext().isContextLost()) disposeRenderer();
   }
 }
 
-async function reportFailure(cause) {
-  if (completed || reportedFailure) return;
-  reportedFailure = true;
-  controller.abort();
+async function reportFailure(job, cause, discard = false) {
+  if (!job || currentJob !== job) return;
+  currentJob = null;
+  job.controller.abort();
   const message = cause instanceof Error ? cause.message : String(cause || 'サムネイル生成に失敗しました');
   document.body.dataset.status = 'failed';
-  document.body.textContent = message;
   console.error('Thumbnail generation failed:', cause);
-  if (!api) throw new Error('サムネイル生成APIが見つかりません');
   try {
-    await api.fail(message);
+    await api.fail(job.id, message, discard);
   } catch (error) {
-    // Retain visible diagnostics even when IPC itself has failed. Main's timeout
-    // still settles the queued task and disposes this isolated renderer.
     console.error('Thumbnail failure report was rejected:', error);
-    document.body.dataset.ipcFailure = String(error?.message || error);
   }
 }
 
-window.addEventListener('beforeunload', () => controller.abort(), { once: true });
-window.addEventListener('error', event => { void reportFailure(event.error || event.message); });
-window.addEventListener('unhandledrejection', event => { void reportFailure(event.reason); });
-
-async function run() {
-  if (!api) throw new Error('サムネイル生成APIが見つかりません');
+async function run(jobId) {
+  if (currentJob) return;
+  const job = { id: jobId, controller: new AbortController() };
+  currentJob = job;
   document.body.dataset.status = 'loading';
-  const input = await api.getInput();
-  const thumbnail = await generateThumbnail(input);
-  if (reportedFailure) return;
+  let thumbnail;
+  try {
+    const input = await api.getInput(jobId);
+    thumbnail = await generateThumbnail(input, job.controller.signal);
+  } catch (cause) {
+    await reportFailure(job, cause);
+    return;
+  }
+  if (currentJob !== job) return;
+  currentJob = null;
   document.body.dataset.status = 'saving';
-  await api.complete(thumbnail);
-  completed = true;
-  document.body.dataset.status = 'complete';
+  try {
+    await api.complete(jobId, thumbnail);
+    if (!currentJob) document.body.dataset.status = 'idle';
+  } catch (error) {
+    // A canceled or replaced worker can no longer report this result.
+    console.error('Thumbnail completion was rejected:', error);
+  }
 }
 
-void run().catch(reportFailure);
+if (!api) throw new Error('サムネイル生成APIが見つかりません');
+const disconnect = api.onJob(jobId => { void run(jobId); });
+window.addEventListener('beforeunload', () => {
+  disconnect();
+  currentJob?.controller.abort();
+  disposeRenderer();
+}, { once: true });
+window.addEventListener('error', event => { void reportFailure(currentJob, event.error || event.message, true); });
+window.addEventListener('unhandledrejection', event => { void reportFailure(currentJob, event.reason, true); });
+void api.ready().catch(error => console.error('Thumbnail worker readiness was rejected:', error));

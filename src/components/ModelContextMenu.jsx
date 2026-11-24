@@ -1,10 +1,11 @@
 import { useEffect, useLayoutEffect, useRef } from 'react';
 import { createPortal } from 'react-dom';
-import { Box, Copy, Eye, ImagePlus, Trash2 } from 'lucide-react';
+import { Box, Copy, Eye, FolderOpen, ImagePlus, Trash2 } from 'lucide-react';
 import './ModelContextMenu.css';
 
 const actions = [
   { id: 'preview', label: 'プレビュー', Icon: Eye },
+  { id: 'relink', label: '元ファイルを再指定', Icon: FolderOpen, missingOnly: true },
   { id: 'thumbnail', label: 'サムネイル生成', Icon: ImagePlus },
   { id: 'copy', label: '指定先へコピー', Icon: Copy },
   { id: 'bambu', label: 'バンブースタジオで開く', Icon: Box },
@@ -23,7 +24,7 @@ export default function ModelContextMenu({ item, anchor, disabled, onClose, onSe
     menu.style.left = `${Math.max(margin, Math.min(anchor.x, window.innerWidth - width - margin))}px`;
     menu.style.top = `${Math.max(margin, Math.min(anchor.y, window.innerHeight - height - margin))}px`;
     menu.querySelector('[role="menuitem"]').focus({ preventScroll: true });
-  }, [anchor]);
+  }, [anchor, item.missing]);
 
   useEffect(() => {
     const dismiss = () => closeRef.current();
@@ -64,7 +65,7 @@ export default function ModelContextMenu({ item, anchor, disabled, onClose, onSe
     <div ref={menuRef} className="model-context-menu" role="menu"
       aria-label={`${item.name} の操作`} onKeyDown={onKeyDown} onContextMenu={event => event.preventDefault()}>
       <div className="model-context-name" title={item.name} aria-hidden="true">{item.name}</div>
-      {actions.map(({ id, label, Icon }) => (
+      {actions.filter(action => !action.missingOnly || item.missing).map(({ id, label, Icon }) => (
         <button key={id} type="button" role="menuitem" tabIndex={-1} aria-disabled={disabled(id)}
           className={id === 'trash' ? 'model-context-delete' : undefined}
           onClick={() => { if (!disabled(id)) onSelect(id); }}>

@@ -3,7 +3,9 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs/promises');
 const os = require('node:os');
 const path = require('node:path');
+const { DatabaseSync } = require('node:sqlite');
 const { Library, assertModelSizeAllowed, idFor, normalize } = require('../electron/library.cjs');
+const { ScadPresets } = require('../electron/scad-presets.cjs');
 
 const legacy = (settings = {}) => ({ schemaVersion: 1, items: [], folders: [], settings, excludedPaths: [] });
 
@@ -128,17 +130,198 @@ test('rescan reconciles missed deletion and modification without losing metadata
   await library.updateItem(id, { notes: 'keep' });
   await library.saveThumbnail(id, 'data:image/png;base64,YWJj');
   assert.equal(library.item(id).hasThumbnail, true);
-  assert.equal(library.readThumbnail(id), 'data:image/png;base64,YWJj');
+  assert.deepEqual(library.readThumbnailImage(id), { mime: 'image/png', bytes: Uint8Array.of(97, 98, 99) });
   await fs.writeFile(file, 'changed');
   await library.rescan();
   assert.equal(library.item(id).notes, 'keep');
   assert.equal(library.item(id).hasThumbnail, false);
-  assert.equal(library.readThumbnail(id), null);
+  assert.equal(library.readThumbnailImage(id), null);
   assert.equal((await library.readModel(id)).length, 7);
   await fs.unlink(file);
   await library.rescan();
   assert.equal(library.item(id).missing, true);
   await assert.rejects(() => library.readModel(id), /見つからない/);
+});
+
+test('relink adopts a pristine watched destination and keeps the model and presets across restart', async t => {
+  const { root, models, library } = await fixture(t, { watch: false });
+  const before = path.join(models, 'old.scad');
+  const after = path.join(models, 'new.scad');
+  await fs.writeFile(before, 'cube(24);');
+  await library.addFolder(models);
+  const id = idFor(before);
+  const oldAddedAt = library.item(id).addedAt;
+  await library.updateItem(id, { favorite: true, tags: ['prototype'], notes: 'keep this' });
+  await library.saveThumbnail(id, 'data:image/png;base64,YWJj');
+  const presets = new ScadPresets(library.database);
+  const presetId = presets.save(id, null, 'Favorite dimensions', {}, []);
+  await fs.rename(before, after);
+  await library.rescan();
+  assert.equal(library.item(id).missing, true);
+  const source = await library.captureRelinkSource(id);
+  const target = await library.inspectRelinkTarget(id, after, source);
+  assert.equal(target.existing.id, idFor(after));
+  await library.relinkModel(id, after, source, target);
+  const updated = library.item(id);
+  assert.equal(updated.path, after);
+  assert.equal(updated.name, 'new.scad');
+  assert.equal(updated.missing, false);
+  assert.equal(updated.addedAt, oldAddedAt);
+  assert.equal(updated.favorite, true);
+  assert.deepEqual(updated.tags, ['prototype']);
+  assert.equal(updated.notes, 'keep this');
+  assert.equal(updated.hasThumbnail, false);
+  assert.equal(presets.get(id, presetId).name, 'Favorite dimensions');
+  assert.equal(library.getState().items.length, 1);
+
+  await fs.writeFile(before, 'cube(48);');
+  await library.importPaths([before, before]);
+  const reused = library.getState().items.find(item => item.path === before);
+  assert.notEqual(reused.id, id);
+  assert.deepEqual(presets.list(reused.id), []);
+  await library.rescan();
+  assert.equal(library.getState().items.length, 2);
+  assert.equal((await library.readModel(id)).length, 'cube(24);'.length);
+  await library.close();
+
+  const reopened = await new Library(path.join(root, 'data'), { watch: false }).init();
+  try {
+    assert.equal(reopened.item(id).path, after);
+    assert.equal(reopened.item(id).notes, 'keep this');
+    assert.equal(reopened.item(reused.id).path, before);
+    const restored = new ScadPresets(reopened.database);
+    assert.equal(restored.get(id, presetId).name, 'Favorite dimensions');
+    await reopened.removeItem(id);
+    await reopened.importPaths([after]);
+    assert.equal(reopened.item(id).path, after);
+    assert.equal(restored.get(id, presetId).name, 'Favorite dimensions');
+    await fs.unlink(after);
+    await reopened.rescan();
+    assert.equal(reopened.item(id).missing, true);
+    assert.equal(reopened.item(reused.id).missing, false);
+  } finally { await reopened.close(); }
+});
+
+test('relink refuses stale sources, unsupported destinations and registrations with their own data', async t => {
+  const { models, library } = await fixture(t, { watch: false });
+  const old = path.join(models, 'obsolete.scad');
+  const next = path.join(models, 'destination.scad');
+  const wrongFormat = path.join(models, 'destination.stl');
+  const id = idFor(old);
+  await fs.writeFile(old, 'cube(24);');
+  await fs.writeFile(next, 'cube(24);');
+  await fs.writeFile(wrongFormat, 'example');
+  await library.importPaths([old]);
+  await assert.rejects(() => library.captureRelinkSource(id), /不在/);
+  await fs.unlink(old);
+  await library.rescan();
+  const source = await library.captureRelinkSource(id);
+  await assert.rejects(() => library.inspectRelinkTarget(id, wrongFormat, source), /同じ形式/);
+  await assert.rejects(() => library.inspectRelinkTarget(id, path.join(models, 'absent.scad'), source), /読み取れません/);
+  const unregistered = await library.inspectRelinkTarget(id, next, source);
+  assert.equal(unregistered.existing, null);
+  await library.importPaths([next]);
+  await assert.rejects(() => library.relinkModel(id, next, source, unregistered), /登録が変わり/);
+  const registered = await library.inspectRelinkTarget(id, next, source);
+  await fs.writeFile(next, 'cube(100);');
+  await assert.rejects(() => library.relinkModel(id, next, source, registered), /ファイルまたは登録が変わり/);
+  await library.updateItem(idFor(next), { notes: 'independent work' });
+  await assert.rejects(() => library.inspectRelinkTarget(id, next, source), /追加データ/);
+  await library.updateItem(idFor(next), { notes: '' });
+  const presets = new ScadPresets(library.database);
+  const presetId = presets.save(idFor(next), null, 'Separate preset', {}, []);
+  await assert.rejects(() => library.inspectRelinkTarget(id, next, source), /別のOpenSCADプリセット/);
+  await library.removeItem(idFor(next));
+  await assert.rejects(() => library.inspectRelinkTarget(id, next, source), /別のOpenSCADプリセット/);
+  assert.equal(presets.get(idFor(next), presetId).name, 'Separate preset');
+  await fs.writeFile(old, 'cube(7);');
+  await assert.rejects(() => library.captureRelinkSource(id), /元の場所にファイル/);
+  assert.equal(library.item(id).path, old);
+});
+
+test('relink rolls back duplicate removal, path alias and thumbnail if the path update fails', async t => {
+  const { models, library } = await fixture(t, { watch: false });
+  const old = path.join(models, 'part.stl');
+  const next = path.join(models, 'moved.stl');
+  const id = idFor(old);
+  await fs.writeFile(old, 'example');
+  await library.addFolder(models);
+  await library.saveThumbnail(id, 'data:image/png;base64,YWJj');
+  await fs.rename(old, next);
+  await library.rescan();
+  const source = await library.captureRelinkSource(id);
+  const target = await library.inspectRelinkTarget(id, next, source);
+  library.database.exec(`CREATE TRIGGER block_relink BEFORE UPDATE OF path ON models
+    WHEN OLD.path != NEW.path BEGIN SELECT RAISE(ABORT, 'simulated relink write error'); END;`);
+  await assert.rejects(() => library.relinkModel(id, next, source, target), /simulated relink write error/);
+  assert.equal(library.item(id).path, old);
+  assert.equal(library.item(id).missing, true);
+  assert.equal(library.item(id).hasThumbnail, true);
+  assert.equal(library.item(idFor(next)).path, next);
+  assert.equal(library.database.prepare('SELECT COUNT(*) AS count FROM model_path_aliases').get().count, 0);
+  assert.equal(library.database.prepare('SELECT COUNT(*) AS count FROM models').get().count, 2);
+  assert.equal(library.database.prepare('SELECT COUNT(*) AS count FROM model_thumbnails').get().count, 1);
+});
+
+test('an in-flight source check rejects a relink even though the model ID is unchanged', async t => {
+  const { models, library } = await fixture(t, { watch: false });
+  const old = path.join(models, 'original.stl');
+  const next = path.join(models, 'renamed.stl');
+  const id = idFor(old);
+  await fs.writeFile(old, 'sample');
+  await library.importPaths([old]);
+  const source = await library.captureFileSource(id);
+  const realStat = fs.stat;
+  let intercepted;
+  let release;
+  const entered = new Promise(resolve => { intercepted = resolve; });
+  const waiting = new Promise(resolve => { release = resolve; });
+  let first = true;
+  t.mock.method(fs, 'stat', async (...args) => {
+    const result = await realStat(...args);
+    if (args[0] === old && first) {
+      first = false;
+      intercepted();
+      await waiting;
+    }
+    return result;
+  });
+  const check = library.assertThumbnailSource(id, source);
+  const rejected = assert.rejects(check, /登録が変更/);
+  try {
+    await entered;
+    await fs.rename(old, next);
+    await library.rescan();
+    const expected = await library.captureRelinkSource(id);
+    const target = await library.inspectRelinkTarget(id, next, expected);
+    await library.relinkModel(id, next, expected, target);
+  } finally {
+    release();
+    await rejected;
+  }
+});
+
+test('version 1 SQLite loads unchanged models and presets after adding path aliases', async t => {
+  const { root, models, library } = await fixture(t, { watch: false });
+  const original = path.join(models, 'before.scad');
+  const id = idFor(original);
+  await fs.writeFile(original, 'cube(22);');
+  await library.importPaths([original]);
+  await library.updateItem(id, { notes: 'from old database' });
+  const presetId = new ScadPresets(library.database).save(id, null, 'Baseline', {}, []);
+  await library.close();
+  const databasePath = path.join(root, 'data', 'library.sqlite3');
+  const before = new DatabaseSync(databasePath);
+  try {
+    before.exec("DROP TABLE model_path_aliases; UPDATE library_meta SET value = 1 WHERE key = 'schema_version'");
+  } finally { before.close(); }
+  const reopened = await new Library(path.dirname(databasePath), { watch: false }).init();
+  try {
+    assert.equal(reopened.item(id).path, original);
+    assert.equal(reopened.item(id).notes, 'from old database');
+    assert.equal(new ScadPresets(reopened.database).get(id, presetId).name, 'Baseline');
+    assert.equal(reopened.database.prepare("SELECT value FROM library_meta WHERE key = 'schema_version'").get().value, 2);
+  } finally { await reopened.close(); }
 });
 
 test('corrupt legacy library is preserved and reported instead of overwritten', async t => {
@@ -203,8 +386,8 @@ test('JSON migration imports SQLite metadata and thumbnail bytes once and retain
     assert.equal(state.settings.memoryBudgetMiB, 4096);
     assert.equal(state.settings.lightweightPreview, false);
     assert.deepEqual(state.settings.futureSetting, { preserved: true });
-    assert.equal(library.readThumbnail(id, state.items[0].thumbnailRevision), image);
-    assert.equal(library.readThumbnail(id, 'stale'), null);
+    assert.deepEqual(library.readThumbnailImage(id, state.items[0].thumbnailRevision), { mime: 'image/webp', bytes: Uint8Array.of(97, 98, 99) });
+    assert.equal(library.readThumbnailImage(id, 'stale'), null);
     assert.deepEqual([...library.database.prepare('SELECT bytes FROM model_thumbnails WHERE model_id = ?').get(id).bytes], [97, 98, 99]);
     await library.updateItem(id, { notes: 'SQLite current value' });
   } finally { await library.close(); }
@@ -212,7 +395,7 @@ test('JSON migration imports SQLite metadata and thumbnail bytes once and retain
   const reopened = await new Library(dataDir, { watch: false }).init();
   try {
     assert.equal(reopened.item(id).notes, 'SQLite current value');
-    assert.equal(reopened.readThumbnail(id), image);
+    assert.deepEqual(reopened.readThumbnailImage(id), { mime: 'image/webp', bytes: Uint8Array.of(97, 98, 99) });
   } finally { await reopened.close(); }
 });
 
@@ -288,13 +471,13 @@ test('a failed write rolls back row deletion, its thumbnail and the in-memory st
     BEGIN SELECT RAISE(ABORT, 'synthetic write failure'); END`);
   await assert.rejects(() => library.removeItem(id), /synthetic write failure/);
   assert.equal(library.item(id).hasThumbnail, true);
-  assert.equal(library.readThumbnail(id), image);
+  assert.deepEqual(library.readThumbnailImage(id), { mime: 'image/png', bytes: Uint8Array.of(97, 98, 99) });
   assert.equal(library.database.prepare('SELECT count(*) AS count FROM models').get().count, 1);
   assert.equal(library.database.prepare('SELECT count(*) AS count FROM excluded_paths').get().count, 0);
   library.database.exec('DROP TRIGGER reject_exclusion');
   await library.removeItem(id);
   assert.equal(library.database.prepare('SELECT count(*) AS count FROM model_thumbnails').get().count, 0);
-  assert.equal(library.readThumbnail(id), null);
+  assert.equal(library.readThumbnailImage(id), null);
 });
 
 test('file preflight follows the selected memory budget and hard ceiling before reading', async t => {

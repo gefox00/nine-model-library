@@ -77,14 +77,16 @@ class ThumbnailBatch extends EventEmitter {
     assertMemoryBudget(memoryBudgetMiB);
     // Do not retain large thumbnails or item metadata in the queue or report.
     const snapshot = items.map(item => ({ id: item.id, name: item.name, path: item.path,
-      size: item.size, modifiedAt: item.modifiedAt, format: item.format,
+      size: item.size, modifiedAt: item.modifiedAt, addedAt: item.addedAt, format: item.format,
       missing: Boolean(item.missing), hasThumbnail: Boolean(item.hasThumbnail ?? item.thumbnail) }));
     const targets = snapshot.filter(item => !item.missing && (overwrite || scope === 'single' || !item.hasThumbnail));
     const skipped = snapshot.length - targets.length;
     this.cancelRequested = false;
     this.state = { ...initialState(), id: randomUUID(), status: 'running', total: snapshot.length,
       processed: skipped, skipped, startedAt: new Date().toISOString(), memoryBudgetMiB, scope };
+    const batchId = this.state.id;
     this.running = this.run(targets).catch(async error => {
+      if (this.state.id !== batchId) return;
       this.state.status = 'cancelled';
       this.state.current = null;
       this.state.finishedAt = new Date().toISOString();
@@ -115,7 +117,7 @@ class ThumbnailBatch extends EventEmitter {
         }), controller.signal);
         clearTimeout(timer);
         if (this.cancelRequested) throw abortError();
-        // Persistence completes before another renderer is created. Cancellation
+        // Persistence completes before another job is sent. Cancellation
         // during an atomic save waits for that save, then stops before the next item.
         await this.saveThumbnail(item, result, { signal: controller.signal });
         this.state.succeeded += 1;
@@ -143,7 +145,7 @@ class ThumbnailBatch extends EventEmitter {
     this.cancelRequested = true;
     this.state.status = 'stopping';
     if (this.active) this.active.abort(abortError());
-    // Abort happens synchronously, before waiting for the report filesystem.
+    // Abort happens synchronously, before waiting for report persistence.
     void this.publish().catch(error => {
       this.state.reportError = `実行結果を保存できません: ${error.message || error}`;
       this.emit('state', this.getState());

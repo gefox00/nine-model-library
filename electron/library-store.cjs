@@ -1,7 +1,10 @@
 const path = require('node:path');
 const { DatabaseSync } = require('node:sqlite');
 
-const schemaVersion = 1;
+const schemaVersion = 2;
+const aliasSchema = `
+  CREATE TABLE model_path_aliases (path_key TEXT PRIMARY KEY, model_id TEXT NOT NULL UNIQUE) STRICT;
+`;
 const schema = `
   CREATE TABLE library_meta (key TEXT PRIMARY KEY, value INTEGER NOT NULL) STRICT;
   CREATE TABLE models (
@@ -61,7 +64,12 @@ class LibraryStore {
       removeFolder: database.prepare('DELETE FROM folders WHERE id = ?'),
       removeExclusion: database.prepare('DELETE FROM excluded_paths WHERE path = ?'),
       removeThumbnail: database.prepare('DELETE FROM model_thumbnails WHERE model_id = ?'),
-      readThumbnail: database.prepare('SELECT mime, bytes, revision FROM model_thumbnails WHERE model_id = ?'),
+      readThumbnailImage: database.prepare('SELECT mime, bytes FROM model_thumbnails WHERE model_id = ? AND revision = ?'),
+      alias: database.prepare(`INSERT INTO model_path_aliases VALUES (?, ?)
+        ON CONFLICT(path_key) DO UPDATE SET model_id = excluded.model_id`),
+      removeAlias: database.prepare('DELETE FROM model_path_aliases WHERE path_key = ?'),
+      relinkTarget: database.prepare('SELECT favorite, notes, tags_json, extra_json FROM models WHERE id = ?'),
+      presetTable: database.prepare("SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'scad_presets'"),
     };
   }
 
@@ -76,6 +84,7 @@ class LibraryStore {
         transaction(database, () => {
           if (existingTables(database).length) return; // Another opener completed migration first.
           database.exec(schema);
+          database.exec(aliasSchema);
           const store = new LibraryStore(database);
           for (const model of legacy.items) {
             store.putModel(model);
@@ -87,10 +96,18 @@ class LibraryStore {
           database.prepare('INSERT INTO library_meta VALUES (?, ?)').run('schema_version', schemaVersion);
         });
       }
-      if (!existingTables(database).some(table => table.name === 'library_meta') ||
-        database.prepare('SELECT value FROM library_meta WHERE key = ?').get('schema_version')?.value !== schemaVersion) {
+      if (!existingTables(database).some(table => table.name === 'library_meta')) {
         throw new Error('対応していないSQLiteライブラリ形式です');
       }
+      const version = database.prepare('SELECT value FROM library_meta WHERE key = ?');
+      if (version.get('schema_version')?.value === 1) {
+        transaction(database, () => {
+          if (version.get('schema_version')?.value !== 1) return;
+          database.exec(aliasSchema);
+          database.prepare('UPDATE library_meta SET value = ? WHERE key = ?').run(schemaVersion, 'schema_version');
+        });
+      }
+      if (version.get('schema_version')?.value !== schemaVersion) throw new Error('対応していないSQLiteライブラリ形式です');
       database.exec('PRAGMA journal_mode = WAL;');
       return new LibraryStore(database);
     } catch (error) {
@@ -126,9 +143,28 @@ class LibraryStore {
   putSetting(key, value) { this.statements.setting.run(key, JSON.stringify(value)); }
   putThumbnail(id, { mime, bytes, revision }) { this.statements.thumbnail.run(id, mime, bytes, revision); }
 
-  apply({ models, folders, settings, excludedPaths, thumbnails }) {
-    if (!models.size && !folders.size && !settings.size && !excludedPaths.size && !thumbnails.size) return;
+  readPathAliases() {
+    return new Map(this.database.prepare('SELECT path_key, model_id FROM model_path_aliases').all()
+      .map(({ path_key, model_id }) => [path_key, model_id]));
+  }
+
+  assertRelinkTargetReusable(id) {
+    const row = this.statements.relinkTarget.get(id);
+    if (row && (row.favorite || row.notes || JSON.parse(row.tags_json).length || Object.keys(JSON.parse(row.extra_json)).length)) {
+      throw new Error('移動先の登録にお気に入り、タグ、メモ、または追加データがあります。再紐付けは中止しました');
+    }
+    if (this.statements.presetTable.get() &&
+        this.database.prepare('SELECT 1 FROM scad_presets WHERE model_id = ? LIMIT 1').get(id)) {
+      throw new Error('移動先には別のOpenSCADプリセットが保存されています。再紐付けは中止しました');
+    }
+  }
+
+  apply({ models, folders, settings, excludedPaths, thumbnails, pathAliases }, { relinkTargetId } = {}) {
+    if (!models.size && !folders.size && !settings.size && !excludedPaths.size && !thumbnails.size && !pathAliases.size) return;
     transaction(this.database, () => {
+      if (relinkTargetId) this.assertRelinkTargetReusable(relinkTargetId);
+      for (const [key, id] of pathAliases) if (!id) this.statements.removeAlias.run(key);
+      for (const [key, id] of pathAliases) if (id) this.statements.alias.run(key, id);
       for (const [id, model] of models) {
         if (model) this.putModel(model);
         else this.statements.removeModel.run(id);
@@ -148,10 +184,9 @@ class LibraryStore {
     });
   }
 
-  readThumbnail(id, revision) {
-    const row = this.statements.readThumbnail.get(id);
-    if (!row || (revision !== undefined && revision !== row.revision)) return null;
-    return `data:${row.mime};base64,${Buffer.from(row.bytes).toString('base64')}`;
+  readThumbnailImage(id, revision) {
+    const row = this.statements.readThumbnailImage.get(id, revision);
+    return row ? { mime: row.mime, bytes: row.bytes } : null;
   }
 
   close() { this.database.close(); }
