@@ -1,99 +1,8 @@
 import { useEffect, useRef, useState } from 'react';
 import * as THREE from 'three';
-import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
-import { loadModel } from '../formats/index.js';
+import { loadModel, disposeModel } from '../formats/index.js';
+import { createViewerEngine, makeGround, fitCamera, setWireframe, captureThumbnail } from './model-viewer-engine.js';
 import './ModelViewer.css';
-
-const BACKGROUND = '#141b25';
-const PRESETS = {
-  iso: new THREE.Vector3(1, -1.4, 0.95),
-  front: new THREE.Vector3(0, -1, 0.001),
-  top: new THREE.Vector3(0, -0.001, 1),
-  right: new THREE.Vector3(1, 0, 0.001),
-};
-
-function disposeObject(root) {
-  if (!root) return;
-  const geometries = new Set();
-  const materials = new Set();
-  const textures = new Set();
-  root.traverse((object) => {
-    if (object.geometry) geometries.add(object.geometry);
-    for (const material of Array.isArray(object.material) ? object.material : [object.material]) {
-      if (!material) continue;
-      materials.add(material);
-      for (const value of Object.values(material)) if (value?.isTexture) textures.add(value);
-    }
-  });
-  geometries.forEach((geometry) => geometry.dispose());
-  materials.forEach((material) => material.dispose());
-  textures.forEach((texture) => texture.dispose());
-}
-
-function setWireframe(root, enabled) {
-  root?.traverse((object) => {
-    if (!object.isMesh) return;
-    for (const material of Array.isArray(object.material) ? object.material : [object.material]) {
-      if (material && 'wireframe' in material) material.wireframe = enabled;
-    }
-  });
-}
-
-function fitCamera(engine, preset = 'iso') {
-  const { camera, controls, dimensions, center } = engine;
-  if (!dimensions) return;
-  // A bounding sphere fits from every preset, including long, narrow parts.
-  const radius = Math.max(dimensions.length() / 2, 0.05);
-  const vertical = THREE.MathUtils.degToRad(camera.fov / 2);
-  const horizontal = Math.atan(Math.tan(vertical) * camera.aspect);
-  const distance = radius / Math.sin(Math.min(vertical, horizontal)) * 1.18;
-  const direction = (PRESETS[preset] || PRESETS.iso).clone().normalize();
-  controls.target.copy(center);
-  camera.position.copy(center).addScaledVector(direction, distance);
-  camera.near = Math.max(radius / 10000, 0.0001);
-  camera.far = Math.max(distance + radius * 100, 100);
-  camera.updateProjectionMatrix();
-  controls.minDistance = radius * 0.02;
-  controls.maxDistance = distance * 20;
-  controls.update();
-  engine.invalidate();
-}
-
-function makeGround(engine, dimensions) {
-  if (engine.ground) {
-    engine.scene.remove(engine.ground);
-    disposeObject(engine.ground);
-  }
-  const largest = Math.max(dimensions.x, dimensions.y, dimensions.z, 0.1);
-  const wantedStep = largest / 7;
-  const exponent = 10 ** Math.floor(Math.log10(wantedStep));
-  const step = [1, 2, 5, 10].map((n) => n * exponent).find((n) => n >= wantedStep);
-  const extent = step * 20;
-  const group = new THREE.Group();
-  const grid = new THREE.GridHelper(extent, 20, 0x3e536b, 0x263445);
-  grid.rotation.x = Math.PI / 2;
-  grid.position.z = -largest * 0.001;
-  const plane = new THREE.Mesh(
-    new THREE.PlaneGeometry(extent, extent),
-    new THREE.ShadowMaterial({ opacity: 0.22 }),
-  );
-  plane.position.z = -largest * 0.002;
-  plane.receiveShadow = true;
-  group.add(grid, plane);
-  group.visible = engine.showGrid;
-  engine.ground = group;
-  engine.gridStep = step;
-  engine.scene.add(group);
-  engine.keyLight.position.set(largest * 1.4, -largest * 1.1, largest * 2.6);
-  engine.keyLight.target.position.copy(engine.center);
-  const shadowCamera = engine.keyLight.shadow.camera;
-  Object.assign(shadowCamera, {
-    left: -largest, right: largest, top: largest, bottom: -largest,
-    near: largest * 0.01, far: largest * 8,
-  });
-  shadowCamera.updateProjectionMatrix();
-  engine.keyLight.shadow.normalBias = largest * 0.002;
-}
 
 export default function ModelViewer({
   item,
@@ -105,8 +14,10 @@ export default function ModelViewer({
   viewPreset = 'iso',
   fitToken = 0,
   memoryBudgetMiB = 2048,
+  manualMemoryBudgetMiB = memoryBudgetMiB,
   lightweightPreview = true,
   reloadToken = 0,
+  onCancel,
   onOpenMemorySettings,
   scadValues,
   scadExecutable,
@@ -115,189 +26,72 @@ export default function ModelViewer({
   const mountRef = useRef(null);
   const engineRef = useRef(null);
   const callbacksRef = useRef({ onMetadata, onThumbnail });
-  const optionsRef = useRef({ viewMode, showGrid, autoRotate, viewPreset, memoryBudgetMiB, scadValues });
+  const optionsRef = useRef({ viewMode, showGrid, autoRotate, viewPreset, memoryBudgetMiB, manualMemoryBudgetMiB, scadValues });
   const [phase, setPhase] = useState('empty');
   const [error, setError] = useState('');
   const [gridStep, setGridStep] = useState(null);
   const [previewImage, setPreviewImage] = useState(null);
-  const [retryToken, setRetryToken] = useState(0);
+  const [retry, setRetry] = useState({ detailed: false });
   callbacksRef.current = { onMetadata, onThumbnail };
-  optionsRef.current = { viewMode, showGrid, autoRotate, viewPreset, memoryBudgetMiB, scadValues };
+  optionsRef.current = { viewMode, showGrid, autoRotate, viewPreset, memoryBudgetMiB, manualMemoryBudgetMiB, scadValues };
+  const canRetryDetailed = !item?.missing && lightweightPreview && manualMemoryBudgetMiB > memoryBudgetMiB && !retry.detailed;
 
   useEffect(() => { onPhaseChange?.(phase); }, [phase, onPhaseChange]);
 
   useEffect(() => {
-    const host = mountRef.current;
-    if (!host) return;
-    let renderer;
-    try {
-      renderer = new THREE.WebGLRenderer({ antialias: !lightweightPreview, alpha: false, powerPreference: lightweightPreview ? 'low-power' : 'default' });
-    } catch (cause) {
-      setError(`3D表示を初期化できませんでした。${cause.message}`);
-      setPhase('error');
-      return;
-    }
-    renderer.setClearColor(BACKGROUND);
-    renderer.outputColorSpace = THREE.SRGBColorSpace;
-    renderer.toneMapping = THREE.ACESFilmicToneMapping;
-    renderer.toneMappingExposure = 1.15;
-    renderer.shadowMap.enabled = !lightweightPreview;
-    renderer.shadowMap.type = THREE.PCFSoftShadowMap;
-    renderer.domElement.setAttribute('aria-label', '3Dモデル。左ドラッグで回転、右ドラッグで移動、ホイールで拡大縮小');
-    renderer.domElement.setAttribute('role', 'img');
-    renderer.domElement.setAttribute('data-testid', 'model-canvas');
-    host.appendChild(renderer.domElement);
-
-    const scene = new THREE.Scene();
-    const camera = new THREE.PerspectiveCamera(38, 1, 0.01, 10000);
-    camera.up.set(0, 0, 1);
-    camera.position.set(100, -140, 100);
-    const controls = new OrbitControls(camera, renderer.domElement);
-    controls.enableDamping = !lightweightPreview;
-    controls.dampingFactor = 0.085;
-    controls.autoRotateSpeed = 1.1;
-    controls.screenSpacePanning = true;
-    const ambient = new THREE.HemisphereLight(0xe9f5ff, 0x52647b, 2.5);
-    ambient.position.set(0, 0, 1);
-    const keyLight = new THREE.DirectionalLight(0xffffff, 3.3);
-    keyLight.castShadow = !lightweightPreview;
-    keyLight.shadow.mapSize.set(2048, 2048);
-    keyLight.shadow.bias = -0.0001;
-    const fillLight = new THREE.DirectionalLight(0x8bbcf6, 1.5);
-    fillLight.position.set(-1, 1, 0.7);
-    scene.add(ambient, keyLight, keyLight.target, fillLight);
-
-    let active = true;
-    let frame = null;
-    const invalidate = () => {
-      if (active && frame === null && !document.hidden) frame = requestAnimationFrame(render);
-    };
-    function render() {
-      frame = null;
-      if (!active || document.hidden) return;
-      controls.autoRotate = optionsRef.current.autoRotate && Boolean(engine.model);
-      controls.update();
-      renderer.render(scene, camera);
-      if (controls.autoRotate) invalidate();
-    }
-    const engine = {
-      renderer, scene, camera, controls, keyLight,
-      model: null, ground: null, dimensions: null, center: new THREE.Vector3(),
-      showGrid: optionsRef.current.showGrid,
-      invalidate,
-    };
-    engineRef.current = engine;
-    const onChange = invalidate;
-    controls.addEventListener('change', onChange);
-    const onStart = () => engine.invalidate();
-    controls.addEventListener('start', onStart);
-    let lastWidth = 0;
-    let lastHeight = 0;
-    const resize = () => {
-      const width = Math.max(host.clientWidth, 1);
-      const height = Math.max(host.clientHeight, 1);
-      if (lastWidth === width && lastHeight === height) return;
-      lastWidth = width;
-      lastHeight = height;
-      renderer.setPixelRatio(lightweightPreview ? Math.min(1, 1280 / width, 900 / height) : Math.min(window.devicePixelRatio || 1, 2));
-      renderer.setSize(width, height);
-      camera.aspect = width / height;
-      camera.updateProjectionMatrix();
-      engine.invalidate();
-    };
-    const observer = new ResizeObserver(resize);
-    observer.observe(host);
-    resize();
-    const onVisibility = () => engine.invalidate();
-    document.addEventListener('visibilitychange', onVisibility);
-    return () => {
-      active = false;
-      if (frame !== null) cancelAnimationFrame(frame);
-      observer.disconnect();
-      document.removeEventListener('visibilitychange', onVisibility);
-      controls.removeEventListener('change', onChange);
-      controls.removeEventListener('start', onStart);
-      controls.dispose();
-      disposeObject(scene);
-      renderer.dispose();
-      renderer.forceContextLoss();
-      renderer.domElement.remove();
-      if (engineRef.current === engine) engineRef.current = null;
-    };
-  }, [lightweightPreview]);
-
-  useEffect(() => {
-    const engine = engineRef.current;
-    if (!engine) return;
     const controller = new AbortController();
-    let cancelled = false;
-    if (engine.model) {
-      engine.scene.remove(engine.model);
-      disposeObject(engine.model);
-      engine.model = null;
-    }
-    if (engine.ground) {
-      engine.scene.remove(engine.ground);
-      disposeObject(engine.ground);
-      engine.ground = null;
-    }
-    engine.dimensions = null;
-    engine.invalidate();
+    const { signal } = controller;
     setGridStep(null);
     setPreviewImage(null);
     setError('');
     callbacksRef.current.onMetadata?.(null);
     if (!item) {
       setPhase('empty');
-      return () => { cancelled = true; controller.abort(); };
+      return;
     }
     if (item.missing) {
       setPhase('error');
       setError('元ファイルが見つかりません。移動先のフォルダを追加するか、元の場所に戻してください。');
-      return () => { cancelled = true; controller.abort(); };
+      return;
     }
     setPhase('loading');
     // Keep a single budget for disk reading and format expansion. Saving a new
     // setting alone must not unexpectedly restart a large model.
-    const loadBudgetMiB = optionsRef.current.memoryBudgetMiB;
+    const loadBudgetMiB = retry.detailed ? optionsRef.current.manualMemoryBudgetMiB : optionsRef.current.memoryBudgetMiB;
+    const loadOptions = { memoryBudgetMiB: loadBudgetMiB, detailed: retry.detailed };
     const isScad = item.format === 'scad';
     const overrides = optionsRef.current.scadValues || {};
     let scadRequestId;
     let modelRequestId;
+    let imageUrl;
+    let engine;
     (async () => {
       let loadedObject;
       try {
         if (isScad && !scadExecutable) throw new Error('設定からOpenSCADの実行ファイルを指定してください。');
         const input = isScad
-          ? await window.nine.renderScad(item.id, overrides, (scadRequestId = crypto.randomUUID()))
-          : { bytes: await window.nine.readModel(item.id, { memoryBudgetMiB: loadBudgetMiB }, (modelRequestId = crypto.randomUUID())) };
+          ? await window.nine.renderScad(item.id, overrides, (scadRequestId = crypto.randomUUID()), loadOptions)
+          : { bytes: await window.nine.readModel(item.id, loadOptions, (modelRequestId = crypto.randomUUID())) };
         scadRequestId = undefined;
         modelRequestId = undefined;
-        if (cancelled) return;
+        signal.throwIfAborted();
         const filename = isScad ? `${item.name}.stl` : item.name;
-        const result = await loadModel(input.bytes, { filename, signal: controller.signal, memoryBudgetMiB: loadBudgetMiB });
+        const result = await loadModel(input.bytes, {
+          filename, signal, memoryBudgetMiB: loadBudgetMiB, consumeInput: true, offThread: true,
+        });
         if (isScad) result.warnings = input.warnings || [];
         loadedObject = result.object;
-        if (cancelled || engineRef.current !== engine) {
-          disposeObject(loadedObject);
-          return;
-        }
+        signal.throwIfAborted();
         if (result.previewImage && !loadedObject) {
-          setPreviewImage(result.previewImage);
+          setPreviewImage({ src: result.previewImage, fallback: false });
           setPhase('preview');
           callbacksRef.current.onMetadata?.({ ...result.metadata, warnings: result.warnings, unit: 'mm' });
           if (item.hasThumbnail) return;
           const image = new Image();
           image.onload = () => {
-            if (cancelled) return;
-            const canvas = document.createElement('canvas');
-            canvas.width = 360; canvas.height = 260;
-            const context = canvas.getContext('2d');
-            if (!context) return;
-            const scale = Math.min(360 / image.width, 260 / image.height);
-            context.fillStyle = BACKGROUND; context.fillRect(0, 0, 360, 260);
-            context.drawImage(image, (360-image.width*scale)/2, (260-image.height*scale)/2, image.width*scale, image.height*scale);
-            callbacksRef.current.onThumbnail?.(canvas.toDataURL('image/png'));
+            if (signal.aborted) return;
+            const thumbnail = captureThumbnail(image, image.naturalWidth, image.naturalHeight);
+            if (thumbnail) callbacksRef.current.onThumbnail?.(thumbnail);
           };
           image.src = result.previewImage;
           return;
@@ -308,6 +102,12 @@ export default function ModelViewer({
         if (![dimensions.x, dimensions.y, dimensions.z].every(Number.isFinite)) {
           throw new Error('モデルの座標に無効な値が含まれています');
         }
+        try {
+          engine = createViewerEngine(mountRef.current, lightweightPreview && !retry.detailed, optionsRef);
+          engineRef.current = engine;
+        } catch (cause) {
+          throw new Error(`3D表示を初期化できませんでした。${cause.message}`, { cause });
+        }
         const wrapper = new THREE.Group();
         wrapper.add(loadedObject);
         wrapper.position.set(-(bounds.min.x + bounds.max.x) / 2, -(bounds.min.y + bounds.max.y) / 2, -bounds.min.z);
@@ -317,7 +117,7 @@ export default function ModelViewer({
           if (!object.isMesh) return;
           objects++;
           triangles += ((object.geometry.index?.count ?? object.geometry.attributes.position?.count ?? 0) / 3) * (object.isInstancedMesh ? object.count : 1);
-          object.castShadow = true;
+          object.castShadow = engine.renderer.shadowMap.enabled;
           object.receiveShadow = false;
         });
         engine.model = wrapper;
@@ -338,42 +138,50 @@ export default function ModelViewer({
           unit: result.unit || 'mm',
         });
         // Existing thumbnails stay untouched on ordinary previews.
-        if (item.hasThumbnail || (isScad && Object.keys(overrides).length)) return;
+        if (item.hasThumbnail || document.hidden || (isScad && Object.keys(overrides).length)) return;
         // Capture immediately after rendering, without retaining the drawing buffer.
-        engine.renderer.render(engine.scene, engine.camera);
-        const canvas = document.createElement('canvas');
-        canvas.width = 360;
-        canvas.height = 260;
-        const context = canvas.getContext('2d');
+        engine.renderNow();
         const source = engine.renderer.domElement;
-        if (context && source.width && source.height) {
-          const scale = Math.min(canvas.width / source.width, canvas.height / source.height);
-          const width = source.width * scale;
-          const height = source.height * scale;
-          context.fillStyle = BACKGROUND;
-          context.fillRect(0, 0, canvas.width, canvas.height);
-          context.drawImage(source, (canvas.width - width) / 2, (canvas.height - height) / 2, width, height);
-          callbacksRef.current.onThumbnail?.(canvas.toDataURL('image/png'));
-        }
+        const thumbnail = captureThumbnail(source, source.width, source.height);
+        if (thumbnail) callbacksRef.current.onThumbnail?.(thumbnail);
       } catch (cause) {
-        if (cancelled || cause?.name === 'AbortError') return;
-        if (loadedObject && !engine.model) disposeObject(loadedObject);
-        setError(cause?.message?.replace(/^Error invoking remote method '[^']+': Error: /, '') || String(cause));
+        if (!engine?.model) disposeModel(loadedObject);
+        if (signal.aborted || cause?.name === 'AbortError') return;
+        engine?.dispose();
+        if (engineRef.current === engine) engineRef.current = null;
+        engine = undefined;
+        const message = cause?.message?.replace(/^Error invoking remote method '[^']+': Error: /, '') || String(cause);
+        if (item.format === '3mf') {
+          const image = await window.nine.readEmbedded3mfImage(item.id, (modelRequestId = crypto.randomUUID())).catch(() => null);
+          modelRequestId = undefined;
+          if (signal.aborted) return;
+          if (image) {
+            imageUrl = URL.createObjectURL(new Blob([image.bytes], { type: image.mime }));
+            setPreviewImage({ src: imageUrl, fallback: true, message });
+            callbacksRef.current.onMetadata?.({ previewOnly: true, warnings: [message] });
+            setPhase('preview');
+            return;
+          }
+        }
+        setError(message);
         setPhase('error');
       }
     })();
     return () => {
-      cancelled = true;
       controller.abort();
       if (scadRequestId) window.nine.cancelScadRender(scadRequestId).catch(() => {});
       if (modelRequestId) window.nine.cancelModelRead(modelRequestId).catch(() => {});
+      if (imageUrl) URL.revokeObjectURL(imageUrl);
+      engine?.dispose();
+      if (engineRef.current === engine) engineRef.current = null;
     };
-  }, [item?.id, item?.modifiedAt, item?.missing, reloadToken, retryToken, scadExecutable, lightweightPreview]);
+  }, [item?.id, item?.modifiedAt, item?.missing, reloadToken, retry, scadExecutable, lightweightPreview]);
 
   useEffect(() => {
     const engine = engineRef.current;
     if (!engine) return;
     setWireframe(engine.model, viewMode === 'wireframe');
+    engine.renderer.shadowMap.needsUpdate = true;
     engine.invalidate();
   }, [viewMode]);
   useEffect(() => {
@@ -388,6 +196,14 @@ export default function ModelViewer({
     if (engine) fitCamera(engine, viewPreset);
   }, [viewPreset, fitToken]);
   useEffect(() => { engineRef.current?.invalidate(); }, [autoRotate]);
+
+  const retryActions = (phase === 'error' || previewImage?.fallback) && (
+    <div className="model-viewer__error-actions">
+      <button type="button" onClick={() => setRetry({ detailed: retry.detailed })}>再読み込み</button>
+      {canRetryDetailed && <button type="button" onClick={() => setRetry({ detailed: true })}>詳細上限で再読み込み</button>}
+      {onOpenMemorySettings && <button type="button" onClick={onOpenMemorySettings}>プレビューメモリ設定</button>}
+    </div>
+  );
 
   return (
     <div className={`model-viewer model-viewer--${phase}`} data-testid="model-viewer" data-phase={phase}>
@@ -406,6 +222,7 @@ export default function ModelViewer({
           <h3>{item?.format === 'scad' ? 'OpenSCADで形状を計算中' : ['step', 'stp'].includes(item?.format?.toLowerCase()) ? 'STEPを変換中' : 'モデルを読み込み中'}</h3>
           <p>{item?.name}</p>
           <span>大きなモデルは少し時間がかかることがあります</span>
+          {onCancel && <div className="model-viewer__error-actions"><button type="button" onClick={onCancel}>読み込みを中止</button></div>}
         </div>
       )}
       {phase === 'error' && (
@@ -413,13 +230,24 @@ export default function ModelViewer({
           <div className="model-viewer__error-symbol">!</div>
           <h3>プレビューできませんでした</h3>
           <p>{error}</p>
-          <div className="model-viewer__error-actions">
-            <button type="button" onClick={() => setRetryToken((value) => value + 1)}>再読み込み</button>
-            {onOpenMemorySettings && <button type="button" onClick={onOpenMemorySettings}>プレビューメモリ設定</button>}
+          {retryActions}
+        </div>
+      )}
+      {phase === 'preview' && previewImage && (
+        <div className="preview-only">
+          <img src={previewImage.src} alt="3MFに保存されたプレビュー画像" onError={() => {
+            if (previewImage.fallback) URL.revokeObjectURL(previewImage.src);
+            setError(previewImage.message || '3MFの内蔵画像を表示できませんでした。');
+            setPreviewImage(null);
+            setPhase('error');
+          }}/>
+          <div>
+            <h3>保存されたプレビュー</h3>
+            <p>{previewImage.fallback ? '3Dを読み込めなかったため、内蔵画像を表示しています。' : 'このファイルには3D形状が含まれていないため、画像を表示しています。'}</p>
+            {retryActions}
           </div>
         </div>
       )}
-      {phase === 'preview' && <div className="preview-only"><img src={previewImage} alt="3MFに保存されたプレビュー画像"/><div><h3>保存されたプレビュー</h3><p>このファイルには3D形状が含まれていないため、画像を表示しています。</p></div></div>}
       {phase === 'ready' && (
         <>
           <div className="model-viewer__axis" aria-label="座標軸: Z上方向">

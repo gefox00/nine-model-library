@@ -2,7 +2,9 @@
 
 This repository is a Windows desktop application for local 3D files. Start with
 [the architecture guide](docs/architecture.md) for code ownership and data flow;
-`README.md` covers usage.
+[`README.md`](README.md) covers usage, and [the MCP guide](docs/mcp.md) covers
+the read-only agent interface. Check [the roadmap](docs/roadmap.md) for current
+limits and measured changes.
 Keep changes focused on the requested behavior and preserve existing library data.
 
 ## Change boundaries
@@ -19,6 +21,12 @@ Keep changes focused on the requested behavior and preserve existing library dat
   mesh loaders. OpenSCAD is converted to STL in main before it reaches a loader.
   Adapters return geometry in millimeters with Z up, accept cancellation and
   preview limits, and dispose resources on failure or cancellation.
+- The main viewport uses a transient worker for 3MF and for STL inputs of
+  256 KiB or larger.
+  Preserve its transferable input and output buffers and stop it on abort.
+  Initialize WebGL when valid geometry is available. Use the explicit detail
+  retry to raise limits for one preview while keeping the library in lightweight
+  mode. The 3MF fallback reads a bounded embedded image by file range.
 - `shared/preview-memory.json` defines preview policy. Keep its main-process and
   renderer implementations equivalent; the parity test checks this. The budget
   adjusts input/geometry limits, not an OS-enforced RAM reservation or cap.
@@ -33,6 +41,9 @@ Keep changes focused on the requested behavior and preserve existing library dat
   changes before updating the in-memory catalog. A schema migration must preserve
   settings, tags, notes, favorites, and exclusions, and retain the legacy JSON.
   Never replace a corrupt library with an empty one or silently roll back to JSON.
+- Reuse startup watcher observations when reconciling the catalog and check
+  registered paths the watcher did not observe. A manual rescan reads the
+  filesystem afresh.
 - Item IDs identify logical registrations. A confirmed relink updates the path
   without changing the ID, presets or user metadata. Normalized path mappings
   must prevent a new file at an old path from taking over its ID. Registration
@@ -65,6 +76,7 @@ Windows; the Electron smoke scripts expect a Windows executable.
 npm ci
 npm test
 npm run build
+node scripts/smoke-memory.mjs
 node scripts/smoke-thumbnails.mjs
 node scripts/smoke-context-menu.mjs
 node scripts/smoke-scad.mjs

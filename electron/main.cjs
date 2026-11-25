@@ -26,6 +26,39 @@ const scadRenders = new Map();
 let scadExport = null;
 let quitting = false;
 
+function previewBudget(options) {
+  if (!options || typeof options !== 'object' || Array.isArray(options) ||
+      Object.keys(options).some(key => key !== 'memoryBudgetMiB' && key !== 'detailed') ||
+      (options.detailed !== undefined && typeof options.detailed !== 'boolean')) {
+    throw new Error('読み込み設定が不正です');
+  }
+  const settings = library.data.settings;
+  const configured = options.detailed ? settings.memoryBudgetMiB : effectivePreviewBudget(settings);
+  return options.memoryBudgetMiB === undefined ? configured : Math.min(configured, assertMemoryBudget(options.memoryBudgetMiB));
+}
+
+function assertPreviewAvailable() {
+  if (library.data.settings.lightweightPreview && (thumbnailBatch.isRunning() || bambuPrint.isPreparing())) {
+    throw new Error('サムネイル生成または印刷準備が終わってからプレビューしてください');
+  }
+}
+
+function runModelRead(requestId, read) {
+  if (requestId !== undefined) validateRequestId(requestId);
+  const previous = activeModelRead;
+  previous?.controller.abort(abortError('別のモデルを選択しました'));
+  const operation = { requestId, controller: new AbortController(), promise: null };
+  activeModelRead = operation;
+  operation.promise = (async () => {
+    try {
+      await previous?.promise.catch(() => {});
+      operation.controller.signal.throwIfAborted();
+      return await read(operation.controller.signal);
+    } finally { if (activeModelRead === operation) activeModelRead = null; }
+  })();
+  return operation.promise;
+}
+
 async function startApp() {
   const profile = libraryDataDirectory(app.getPath('appData'), process.env.NINE_DATA_DIR);
   mkdirSync(profile, { recursive: true });
@@ -147,29 +180,24 @@ async function boot() {
     return library.trashModel(id, source, file => shell.trashItem(file));
   });
   handle('readModel', (id, options = {}, requestId) => {
-    if (!options || typeof options !== 'object' || Array.isArray(options) ||
-        Object.keys(options).some(key => key !== 'memoryBudgetMiB')) throw new Error('読み込み設定が不正です');
-    if (requestId !== undefined) validateScadRequestId(requestId);
-    if (library.data.settings.lightweightPreview && (thumbnailBatch.isRunning() || bambuPrint.isPreparing())) {
-      throw new Error('サムネイル生成または印刷準備が終わってからプレビューしてください');
-    }
-    const configured = effectivePreviewBudget(library.data.settings);
-    const budget = options.memoryBudgetMiB === undefined ? configured : Math.min(configured, assertMemoryBudget(options.memoryBudgetMiB));
-    const previous = activeModelRead;
-    previous?.controller.abort(abortError('別のモデルを選択しました'));
-    const operation = { requestId, controller: new AbortController(), promise: null };
-    activeModelRead = operation;
-    operation.promise = (async () => {
-      try {
-        await previous?.promise.catch(() => {});
-        operation.controller.signal.throwIfAborted();
-        return await library.readModel(id, { memoryBudgetMiB: budget, signal: operation.controller.signal });
-      } finally { if (activeModelRead === operation) activeModelRead = null; }
-    })();
-    return operation.promise;
+    assertPreviewAvailable();
+    const memoryBudgetMiB = previewBudget(options);
+    return runModelRead(requestId, signal => library.readModel(id, { memoryBudgetMiB, signal }));
+  });
+  handle('readEmbedded3mfImage', (id, requestId) => {
+    assertPreviewAvailable();
+    return runModelRead(requestId, async signal => {
+      if (library.item(id).format !== '3mf') return null;
+      const source = await library.captureFileSource(id);
+      const { readEmbedded3mfImage } = require('./three-mf-thumbnail.cjs');
+      const image = await readEmbedded3mfImage(source.path, signal);
+      signal.throwIfAborted();
+      await library.assertThumbnailSource(id, source, 'プレビュー画像の読み込み');
+      return image;
+    });
   });
   handle('cancelModelRead', requestId => {
-    validateScadRequestId(requestId);
+    validateRequestId(requestId);
     if (!activeModelRead || activeModelRead.requestId !== requestId) return false;
     activeModelRead.controller.abort(abortError('読み込みを中止しました'));
     return true;
@@ -190,12 +218,11 @@ async function boot() {
     await library.assertThumbnailSource(id, source, 'パラメータ読み取り');
     return result;
   });
-  handle('renderScad', async (id, values, requestId) => {
+  handle('renderScad', async (id, values, requestId, options = {}) => {
     requireScadItem(id);
-    if (library.data.settings.lightweightPreview && (thumbnailBatch.isRunning() || bambuPrint.isPreparing())) {
-      throw new Error('サムネイル生成または印刷準備が終わってからプレビューしてください');
-    }
-    validateScadRequestId(requestId);
+    assertPreviewAvailable();
+    validateRequestId(requestId);
+    const memoryBudgetMiB = previewBudget(options);
     if (scadRenders.has(requestId)) throw new Error('同じOpenSCAD要求がすでに実行中です');
     if (scadRenders.size >= 8) throw new Error('OpenSCADの待機中要求が多すぎます。前の処理を中止してください');
     const controller = new AbortController();
@@ -203,14 +230,14 @@ async function boot() {
     try {
       const source = await library.captureFileSource(id);
       const result = await scad.renderScad({ executable: library.data.settings.openscadPath,
-        sourcePath: source.path, values: values ?? {}, memoryBudgetMiB: effectivePreviewBudget(library.data.settings), signal: controller.signal });
+        sourcePath: source.path, values: values ?? {}, memoryBudgetMiB, signal: controller.signal });
       controller.signal.throwIfAborted();
       await library.assertThumbnailSource(id, source, 'プレビュー生成');
       return result;
     } finally { scadRenders.delete(requestId); }
   });
   handle('cancelScadRender', requestId => {
-    validateScadRequestId(requestId);
+    validateRequestId(requestId);
     const controller = scadRenders.get(requestId);
     if (!controller) return false;
     controller.abort(abortError('OpenSCADのプレビューを中止しました'));
@@ -364,8 +391,8 @@ function registerScadPresetIpc(presets) {
   });
 }
 
-function validateScadRequestId(requestId) {
-  if (typeof requestId !== 'string' || !/^[A-Za-z0-9_.:-]{1,128}$/.test(requestId)) throw new Error('OpenSCADの要求IDが不正です');
+function validateRequestId(requestId) {
+  if (typeof requestId !== 'string' || !/^[A-Za-z0-9_.:-]{1,128}$/.test(requestId)) throw new Error('要求IDが不正です');
 }
 
 function createWindow() {

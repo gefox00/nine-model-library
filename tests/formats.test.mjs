@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import { createRequire } from 'node:module';
+import { Worker as NodeWorker } from 'node:worker_threads';
 import vm from 'node:vm';
 import * as THREE from 'three';
 import { DOMParser } from '@xmldom/xmldom';
@@ -227,4 +228,74 @@ test('3MF cached instances survive releasing their original object DOM', async (
   assert.equal(result.metadata.triangles, 24);
   result.object.traverse((node) => { if (node.isMesh) assert.equal(node.geometry.getAttribute('color'), undefined); });
   disposeModel(result.object);
+});
+
+test('on-demand mesh workers transfer owned data, preserve instances, and cancel', async () => {
+  const workers = [];
+  class BrowserWorker extends NodeWorker {
+    constructor(url) {
+      super(`
+        const { parentPort } = require('node:worker_threads');
+        globalThis.self = { postMessage: (...args) => parentPort.postMessage(...args) };
+        import(${JSON.stringify(url.href)}).then(() => {
+          parentPort.on('message', (data) => self.onmessage({ data }));
+        });
+      `, { eval: true });
+      this.on('message', (data) => this.onmessage?.({ data }));
+      this.on('error', (error) => this.onerror?.(error));
+      workers.push(this);
+    }
+
+    terminate() {
+      this.exit = super.terminate();
+      return this.exit;
+    }
+  }
+
+  const previousWorker = globalThis.Worker;
+  globalThis.Worker = BrowserWorker;
+  try {
+    const stl = await fixture('cube-mm.stl');
+    const small = await loadModel(stl, { filename: 'small.stl', offThread: true });
+    assert.equal(workers.length, 0);
+    disposeModel(small.object);
+
+    const facets = 12 * 500;
+    const bytes = new Uint8Array(84 + facets * 50);
+    new DataView(bytes.buffer).setUint32(80, facets, true);
+    for (let offset = 84; offset < bytes.byteLength; offset += 600) bytes.set(stl.subarray(84), offset);
+    const large = await loadModel(bytes, { filename: 'large.stl', offThread: true, consumeInput: true });
+    assert.equal(bytes.byteLength, 0);
+    assert.equal(large.object.geometry.attributes.position.array.byteLength, facets * 9 * Float32Array.BYTES_PER_ELEMENT);
+    close(bounds(large.object).getSize(new THREE.Vector3()).toArray(), [20,30,10]);
+    disposeModel(large.object);
+
+    const colorResource = '<basematerials id="2"><base name="Red" displaycolor="#cc3311"/></basematerials>';
+    const xml = modelXML(`${colorResource}<object id="1" pid="2" pindex="0">${meshXML()}</object>`, '<item objectid="1"/><item objectid="1" transform="1 0 0 0 1 0 0 0 1 30 0 0"/>');
+    const data = make3MF({ '3D/3dmodel.model': xml });
+    const originalSize = data.byteLength;
+    const model = await loadModel(data, { filename: 'shared.3mf', offThread: true });
+    assert.equal(data.byteLength, originalSize);
+    const [first, second] = model.object.children;
+    assert.strictEqual(first.geometry, second.geometry);
+    assert.strictEqual(first.material, second.material);
+    assert.equal(first.material.vertexColors, true);
+    assert.equal(first.geometry.getAttribute('color').count, 36);
+    assert.equal(model.metadata.triangles, 24);
+    close(bounds(model.object).getSize(new THREE.Vector3()).toArray(), [50,30,10]);
+    disposeModel(model.object);
+
+    const invalid = make3MF({ '3D/3dmodel.model': '<model><resources></model>' });
+    await assert.rejects(() => loadModel(invalid, { filename: 'invalid.3mf', offThread: true }), /XMLが壊れています/);
+
+    const controller = new AbortController();
+    const aborted = loadModel(data, { filename: 'cancel.3mf', offThread: true, signal: controller.signal });
+    controller.abort();
+    await assert.rejects(aborted, { name: 'AbortError' });
+    assert.equal(workers.length, 4);
+    assert.ok(workers.every((worker) => worker.exit instanceof Promise));
+  } finally {
+    globalThis.Worker = previousWorker;
+    await Promise.all(workers.map((worker) => worker.exit || worker.terminate()));
+  }
 });

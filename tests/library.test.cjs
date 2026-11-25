@@ -76,6 +76,70 @@ test('watcher handles nested add, write, delete and reappearance; removing folde
   assert.equal(library.getState().items.length, 1);
 });
 
+test('watch startup reuses discovered files and keeps an unchanged watch configuration', async t => {
+  const { root, models, library } = await fixture(t, { watch: false });
+  const nested = path.join(models, 'nested');
+  await fs.mkdir(nested);
+  const kept = path.join(models, 'kept.stl');
+  const removed = path.join(nested, 'removed.stl');
+  const discovered = path.join(nested, 'discovered.stp');
+  const explicit = path.join(root, 'outside.3mf');
+  const absentRoot = path.join(root, 'unavailable');
+  await fs.mkdir(absentRoot);
+  await Promise.all([kept, removed, explicit].map(file => fs.writeFile(file, 'original')));
+  await library.addFolder(models);
+  await library.addFolder(nested);
+  await library.addFolder(absentRoot);
+  await library.importPaths([explicit]);
+  await library.updateItem(idFor(kept), { notes: 'persisted metadata' });
+  await library.close();
+  await fs.rmdir(absentRoot);
+  await fs.unlink(removed);
+  await Promise.all([kept, explicit, discovered].map(file => fs.writeFile(file, 'revised model')));
+
+  const reopened = new Library(path.dirname(library.file), { stabilityThreshold: 100 });
+  const walk = t.mock.method(reopened, 'walk');
+  const snapshot = t.mock.method(reopened, 'getState');
+  const stats = t.mock.method(fs, 'stat');
+  try {
+    await reopened.init();
+    const checked = file => stats.mock.calls.filter(call => call.arguments[0] === file).length;
+    assert.equal(walk.mock.callCount(), 0);
+    assert.equal(snapshot.mock.callCount(), 0);
+    assert.equal(checked(kept), 0);
+    assert.equal(checked(discovered), 0);
+    assert.equal(checked(removed), 1);
+    assert.equal(checked(explicit), 1);
+    assert.equal(reopened.item(idFor(kept)).notes, 'persisted metadata');
+    assert.equal(reopened.item(idFor(kept)).size, 13);
+    assert.equal(reopened.item(idFor(discovered)).size, 13);
+    assert.equal(reopened.item(idFor(removed)).missing, true);
+    assert.equal(reopened.item(idFor(explicit)).size, 13);
+    assert.match(reopened.getState().status.message, /unavailable/);
+
+    const watcher = reopened.watcher;
+    await reopened.addFolder(models);
+    await reopened.removeFolder('missing-folder-id');
+    assert.equal(reopened.watcher, watcher);
+    assert.equal(checked(removed), 1);
+
+    await reopened.rescan();
+    assert.ok(walk.mock.callCount() > 0);
+    assert.equal(checked(kept), 1);
+    assert.equal(checked(discovered), 1);
+  } finally { await reopened.close(); }
+});
+
+test('explicit import uses one stat per input path', async t => {
+  const { models, library } = await fixture(t, { watch: false });
+  const file = path.join(models, 'direct.stl');
+  await fs.writeFile(file, 'model');
+  const stat = t.mock.method(fs, 'stat');
+  const state = await library.importPaths([file, file]);
+  assert.equal(state.items.length, 1);
+  assert.equal(stat.mock.calls.filter(call => call.arguments[0] === file).length, 1);
+});
+
 test('concurrent folder registration keeps both watches and shutdown drains writes', async t => {
   const { root, models, library } = await fixture(t, { stabilityThreshold: 100 });
   const second = path.join(root, 'more-models');

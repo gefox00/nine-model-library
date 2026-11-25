@@ -57,7 +57,7 @@ export function objectFromStep(result, limits = LIMITS) {
   }
 }
 
-export async function loadSTEP(buffer, { signal, limits = LIMITS } = {}) {
+export async function loadSTEP(buffer, { signal, limits = LIMITS, ownsBuffer = false } = {}) {
   abortIfNeeded(signal);
   const worker = new Worker(new URL(`${import.meta.env.BASE_URL}occt/step-worker.js`, window.location.href));
   return new Promise((resolve, reject) => {
@@ -78,8 +78,7 @@ export async function loadSTEP(buffer, { signal, limits = LIMITS } = {}) {
       if (data.error) return finish(new Error(data.error));
       try { finish(null, objectFromStep(data.result, limits)); } catch (error) { finish(error); }
     };
-    // Transfer a copy: callers may retain the original bytes for other adapters.
-    const transferred = buffer.slice(0);
+    const transferred = ownsBuffer ? buffer : buffer.slice(0);
     try { worker.postMessage({ buffer: transferred, limits, hardTriangleLimit: HARD_LIMITS.triangles }, [transferred]); } catch (error) { finish(error); }
   });
 }

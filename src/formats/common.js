@@ -29,11 +29,12 @@ export function arrayBufferOf(bytes) {
   throw new TypeError('モデルデータが不正です');
 }
 
-export function checkInput(bytes, signal, limits = LIMITS) {
+export function checkInput(bytes, signal, limits = LIMITS, consumeInput = false) {
   abortIfNeeded(signal);
   if (!(bytes instanceof ArrayBuffer) && !ArrayBuffer.isView(bytes)) throw new TypeError('モデルデータが不正です');
   if (!bytes.byteLength) throw new Error('ファイルが空です');
   if (bytes.byteLength > limits.fileBytes) throw limitExceeded('入力ファイルのサイズ', bytes.byteLength, limits.fileBytes, { bytes: true, hard: limits.fileBytes >= HARD_LIMITS.fileBytes });
+  if (consumeInput && bytes.buffer instanceof ArrayBuffer && bytes.byteOffset === 0 && bytes.byteLength === bytes.buffer.byteLength) return bytes.buffer;
   return arrayBufferOf(bytes);
 }
 

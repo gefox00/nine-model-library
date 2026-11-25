@@ -4,11 +4,32 @@ import { abortIfNeeded, DEFAULT_COLOR, disposeModel, LIMITS, limitExceeded, surf
 import { HARD_LIMITS } from './preview-memory.js';
 
 const UNITS = { micron: 0.001, millimeter: 1, centimeter: 10, inch: 25.4, foot: 304.8, meter: 1000 };
-const localName = (node) => node.localName || node.nodeName.split(':').at(-1);
-const children = (node, name) => Array.from(node?.childNodes ?? []).filter((child) => child.nodeType === 1 && (!name || localName(child) === name));
-const child = (node, name) => children(node, name)[0];
+const localName = (node) => node.localName || node.local || node.nodeName.split(':').at(-1);
 const attr = (node, name) => node?.getAttribute(name) || '';
-const nsAttr = (node, name) => Array.from(node?.attributes ?? []).find((item) => localName(item) === name)?.value || '';
+const VERTEX_ATTRS = ['v1', 'v2', 'v3'];
+const COLOR_ATTRS = ['p1', 'p2', 'p3'];
+
+function children(node, name) {
+  const result = [];
+  for (let child = node?.firstChild; child; child = child.nextSibling) {
+    if (child.nodeType === 1 && (!name || localName(child) === name)) result.push(child);
+  }
+  return result;
+}
+
+function child(node, name) {
+  for (let item = node?.firstChild; item; item = item.nextSibling) {
+    if (item.nodeType === 1 && localName(item) === name) return item;
+  }
+}
+
+function nsAttr(node, name) {
+  for (let i = 0; i < (node?.attributes?.length ?? 0); i++) {
+    const item = node.attributes[i];
+    if (localName(item) === name) return item.value;
+  }
+  return '';
+}
 
 function archivePath(value, from = '') {
   let decoded;
@@ -23,12 +44,17 @@ function archivePath(value, from = '') {
   return parts.join('/');
 }
 
-function parseXML(data, label) {
+function parseXML(data, label, parseDocument) {
   const text = strFromU8(data);
   if (/<!DOCTYPE|<!ENTITY/i.test(text)) throw new Error('DOCTYPEを含む3MFは表示できません');
+  const root = parseDocument(text);
+  if (!root) throw new Error(`3MFのXMLが壊れています: ${label}`);
+  return root;
+}
+
+function nativeXmlDocument(text) {
   const document = new DOMParser().parseFromString(text, 'application/xml');
-  if (!document.documentElement || document.getElementsByTagName('parsererror').length) throw new Error(`3MFのXMLが壊れています: ${label}`);
-  return document.documentElement;
+  return document.getElementsByTagName('parsererror').length ? undefined : document.documentElement;
 }
 
 function finiteNumber(value, label) {
@@ -88,7 +114,7 @@ export function inspect3MFArchive(buffer, { signal, limits = LIMITS } = {}) {
 }
 
 /** 3MF geometry reader. Object identity is scoped to its ZIP model part. */
-export async function load3MF(buffer, { signal, limits = LIMITS } = {}) {
+export async function load3MF(buffer, { signal, limits = LIMITS, parseDocument = nativeXmlDocument } = {}) {
   // Validate every member before allocating any expanded XML, including members
   // near the end of the archive. Limits inside an inflating filter are too late.
   const { selected, thumbnails } = inspect3MFArchive(buffer, { signal, limits });
@@ -143,7 +169,7 @@ export async function load3MF(buffer, { signal, limits = LIMITS } = {}) {
     if (models.has(path)) return models.get(path);
     const data = extractPart(path);
     if (!data) throw new Error(`3MFの部品ファイルが見つかりません: ${path}`);
-    const xml = parseXML(data, path);
+    const xml = parseXML(data, path, parseDocument);
     if (localName(xml) !== 'model') throw new Error(`3MFのモデル定義が不正です: ${path}`);
     const unit = attr(xml, 'unit') || 'millimeter';
     if (!(unit in UNITS)) throw new Error(`未対応の3MF単位です: ${unit}`);
@@ -169,27 +195,34 @@ export async function load3MF(buffer, { signal, limits = LIMITS } = {}) {
   }
 
   function meshFromXML(model, definition, meshXML) {
-    const vertexNodes = children(child(meshXML, 'vertices'), 'vertex');
-    const triangleNodes = children(child(meshXML, 'triangles'), 'triangle');
-    if (!vertexNodes.length || !triangleNodes.length) throw new Error('3MFのメッシュに頂点または三角形がありません');
-    triangleCount += triangleNodes.length;
+    const vertexXML = child(meshXML, 'vertices');
+    const triangleXML = child(meshXML, 'triangles');
+    const pointRows = vertexXML?.pointRows;
+    const indexRows = triangleXML?.indexRows;
+    const vertexNodes = pointRows ? null : children(vertexXML, 'vertex');
+    const triangleNodes = indexRows ? null : children(triangleXML, 'triangle');
+    const vertexCount = pointRows ? pointRows.length / 3 : vertexNodes.length;
+    const meshTriangles = indexRows ? indexRows.length / 3 : triangleNodes.length;
+    if (!vertexCount || !meshTriangles) throw new Error('3MFのメッシュに頂点または三角形がありません');
+    triangleCount += meshTriangles;
     if (triangleCount > limits.triangles) throw limitExceeded('3MFの三角形数', triangleCount, limits.triangles, { hard: limits.triangles >= HARD_LIMITS.triangles });
-    if (vertexNodes.length > limits.triangles * 3) throw limitExceeded('3MFの頂点数', vertexNodes.length, limits.triangles * 3, { hard: limits.triangles >= HARD_LIMITS.triangles });
-    const vertices = new Float32Array(vertexNodes.length * 3);
-    for (let i = 0; i < vertexNodes.length; i++) {
-      const node = vertexNodes[i];
-      vertices[i * 3] = finiteNumber(attr(node, 'x'), 'X座標');
-      vertices[i * 3 + 1] = finiteNumber(attr(node, 'y'), 'Y座標');
-      vertices[i * 3 + 2] = finiteNumber(attr(node, 'z'), 'Z座標');
+    if (vertexCount > limits.triangles * 3) throw limitExceeded('3MFの頂点数', vertexCount, limits.triangles * 3, { hard: limits.triangles >= HARD_LIMITS.triangles });
+    const vertices = new Float32Array(vertexCount * 3);
+    for (let i = 0; i < vertexCount; i++) {
+      const offset = i * 3;
+      const node = vertexNodes?.[i];
+      vertices[offset] = finiteNumber(pointRows ? pointRows[offset] : attr(node, 'x'), 'X座標');
+      vertices[offset + 1] = finiteNumber(pointRows ? pointRows[offset + 1] : attr(node, 'y'), 'Y座標');
+      vertices[offset + 2] = finiteNumber(pointRows ? pointRows[offset + 2] : attr(node, 'z'), 'Z座標');
     }
-    const positions = new Float32Array(triangleNodes.length * 9);
+    const positions = new Float32Array(meshTriangles * 9);
     let colors;
     const defaultColor = new THREE.Color(DEFAULT_COLOR);
     const objectPID = attr(definition, 'pid');
     const objectPIndex = attr(definition, 'pindex') || '0';
     let colored = false;
-    for (let i = 0; i < triangleNodes.length; i++) {
-      const triangle = triangleNodes[i];
+    for (let i = 0; i < meshTriangles; i++) {
+      const triangle = indexRows ? triangleXML.triangleStyles?.get(i) : triangleNodes[i];
       if (attr(triangle, 'paint_color')) hasPaint = true;
       const pid = attr(triangle, 'pid') || objectPID;
       const palette = model.colors.get(pid);
@@ -204,11 +237,14 @@ export async function load3MF(buffer, { signal, limits = LIMITS } = {}) {
       }
       const first = attr(triangle, 'p1') || objectPIndex;
       for (let corner = 0; corner < 3; corner++) {
-        const vertex = integer(attr(triangle, `v${corner + 1}`), '頂点インデックス');
-        if (vertex >= vertexNodes.length) throw new Error('3MFの頂点参照が範囲外です');
+        const vertex = integer(indexRows ? indexRows[i * 3 + corner] : attr(triangle, VERTEX_ATTRS[corner]), '頂点インデックス');
+        if (vertex >= vertexCount) throw new Error('3MFの頂点参照が範囲外です');
         const dest = i * 9 + corner * 3;
-        positions.set(vertices.subarray(vertex * 3, vertex * 3 + 3), dest);
-        const pindex = attr(triangle, `p${corner + 1}`) || first;
+        const source = vertex * 3;
+        positions[dest] = vertices[source];
+        positions[dest + 1] = vertices[source + 1];
+        positions[dest + 2] = vertices[source + 2];
+        const pindex = attr(triangle, COLOR_ATTRS[corner]) || first;
         const color = palette?.[integer(pindex, '色インデックス')] || defaultColor;
         if (palette) colored = true;
         if (colors) {
@@ -266,7 +302,7 @@ export async function load3MF(buffer, { signal, limits = LIMITS } = {}) {
     let rootPath;
     const relationships = extractPart('_rels/.rels');
     if (relationships) {
-      const xml = parseXML(relationships, '_rels/.rels');
+      const xml = parseXML(relationships, '_rels/.rels', parseDocument);
       const relationship = children(xml, 'Relationship').find((item) => /\/3dmodel$/.test(attr(item, 'Type')));
       if (relationship) rootPath = archivePath(attr(relationship, 'Target'));
     }

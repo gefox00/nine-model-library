@@ -62,7 +62,8 @@ class Library extends EventEmitter {
     this.aliasPathsById = new Map();
     this.excluded = new Set();
     this.status = { scanning: false, message: '' };
-    this.watchers = [];
+    this.watcher = null;
+    this.watchedRoots = null;
     this.queue = Promise.resolve();
     this.watcherQueue = Promise.resolve();
     this.watcherLifetime = new AbortController();
@@ -124,7 +125,7 @@ class Library extends EventEmitter {
   async syncFiles() {
     // Reconcile only once, after the watcher is ready, so initial changes cannot be lost.
     await this.startWatchers();
-    if (!this.closed && !this.watchers.length) await this.rescan();
+    if (!this.closed && !this.watcher) await this.reconcile();
   }
 
   get database() { return this.store?.database; }
@@ -239,15 +240,14 @@ class Library extends EventEmitter {
     return derived;
   }
 
-  async upsert(file, changes, { explicit = false } = {}) {
+  async upsert(file, changes, { explicit = false, stat } = {}) {
     const absolute = path.resolve(file);
     const format = formatFor(absolute);
     if (!format || this.ignored(absolute)) return false;
     const key = normalize(absolute);
     const excluded = changes.excludedPaths.get(key) ?? this.excluded.has(key);
     if (excluded && !explicit) return;
-    let stat;
-    try { stat = await fs.stat(absolute); }
+    try { stat ??= await fs.stat(absolute); }
     catch (error) { if (error.code === 'ENOENT') return this.markMissing(absolute, changes); throw error; }
     if (!stat.isFile()) return this.markMissing(absolute, changes);
     if (excluded) changes.excludedPaths.set(key, false);
@@ -297,15 +297,25 @@ class Library extends EventEmitter {
       const file = path.join(directory, entry.name);
       if (entry.isSymbolicLink() || this.ignored(file)) continue;
       if (entry.isDirectory()) await this.walk(file, changes, visitedFiles, visitedFolders);
-      else if (entry.isFile() && formatFor(file) && !visitedFiles.has(normalize(file))) {
-        visitedFiles.add(normalize(file));
-        try { await this.upsert(file, changes); }
-        catch (error) { this.status.message = `読み取りを保留: ${path.basename(file)} (${error.code || error.message})`; }
+      else if (entry.isFile() && formatFor(file)) {
+        const fileKey = normalize(file);
+        if (visitedFiles.has(fileKey)) continue;
+        visitedFiles.add(fileKey);
+        await this.reconcileFile(file, changes);
       }
     }
   }
 
   rescan() {
+    return this.reconcile({ returnState: true });
+  }
+
+  async reconcileFile(file, changes, stat) {
+    try { await this.upsert(file, changes, { stat }); }
+    catch (error) { this.status.message = `読み取りを保留: ${path.basename(file)} (${error.code || error.message})`; }
+  }
+
+  reconcile({ observedFiles, unavailableRoot, returnState = false } = {}) {
     return this.enqueue(async () => {
       this.status = { scanning: true, message: 'フォルダを確認しています…' };
       this.notify();
@@ -313,19 +323,30 @@ class Library extends EventEmitter {
       try {
         this.status.message = '';
         const changes = newChanges();
-        const visitedFiles = new Set();
+        const visitedFiles = observedFiles ? null : new Set();
         for (const item of this.data.items) {
           if (this.closed) break;
-          visitedFiles.add(normalize(item.path));
-          try { await this.upsert(item.path, changes); }
-          catch (error) { this.status.message = `読み取りを保留: ${item.name} (${error.code || error.message})`; }
+          const key = normalize(item.path);
+          visitedFiles?.add(key);
+          // Files outside a watch root and files removed while the app was closed still need a stat.
+          const stat = observedFiles?.get(key)?.stat;
+          observedFiles?.delete(key);
+          await this.reconcileFile(item.path, changes, stat);
         }
-        const visitedFolders = new Set();
-        for (const folder of this.data.folders) await this.walk(folder.path, changes, visitedFiles, visitedFolders);
+        if (observedFiles) {
+          for (const { file, stat } of observedFiles.values()) {
+            if (this.closed) break;
+            await this.reconcileFile(file, changes, stat);
+          }
+          if (unavailableRoot) this.status.message = `読み取れないフォルダがあります: ${unavailableRoot}`;
+        } else {
+          const visitedFolders = new Set();
+          for (const folder of this.data.folders) await this.walk(folder.path, changes, visitedFiles, visitedFolders);
+        }
         this.apply(changes, { notify: false });
       } finally {
         this.status.scanning = false;
-        state = this.getState();
+        if (returnState) state = this.getState();
         this.notify(state);
       }
       return state;
@@ -339,22 +360,41 @@ class Library extends EventEmitter {
   }
 
   async restartWatchers() {
-    await Promise.all(this.watchers.map(watcher => watcher.close()));
-    this.watchers = [];
-    if (this.closed || !this.data.folders.length || this.options.watch === false) return;
+    if (this.closed || this.options.watch === false) return;
+    const paths = this.data.folders.map(folder => folder.path);
+    const roots = new Set(paths.map(normalize));
+    if (this.watchedRoots?.size === roots.size && [...roots].every(root => this.watchedRoots.has(root))) return;
+    if (this.watcher) await this.watcher.close();
+    this.watcher = null;
+    this.watchedRoots = null;
+    if (this.closed || !paths.length) return;
     const { watch } = await import('chokidar');
     if (this.closed) return;
-    const watcher = watch(this.data.folders.map(folder => folder.path), {
-      ignoreInitial: true,
+    const watcher = watch(paths, {
       ignored: file => this.ignored(file),
       persistent: true,
       followSymlinks: false,
       awaitWriteFinish: { stabilityThreshold: this.options.stabilityThreshold ?? 600, pollInterval: 100 },
       atomic: true,
     });
-    this.watchers.push(watcher);
-    const change = file => {
+    this.watcher = watcher;
+    // Reuse Chokidar's startup traversal instead of immediately walking the same tree again.
+    let initialFiles = new Map();
+    const unavailableRoots = new Set(roots);
+    const addDir = directory => unavailableRoots.delete(normalize(directory));
+    const unlinkDir = directory => {
+      const key = normalize(directory);
+      if (roots.has(key)) unavailableRoots.add(key);
+    };
+    watcher.on('addDir', addDir).on('unlinkDir', unlinkDir);
+    const change = (file, stat) => {
       if (!formatFor(file) || this.closed) return;
+      if (initialFiles) {
+        const key = normalize(file);
+        if (stat && !stat.isFile()) initialFiles.delete(key);
+        else initialFiles.set(key, { file, stat });
+        return;
+      }
       this.enqueue(async () => {
         const changes = newChanges();
         await this.upsert(file, changes);
@@ -364,34 +404,54 @@ class Library extends EventEmitter {
     };
     watcher.on('add', change).on('change', change).on('unlink', file => {
       if (this.closed || !formatFor(file)) return;
+      if (initialFiles) {
+        initialFiles.delete(normalize(file));
+        return;
+      }
       this.enqueue(() => {
         const changes = newChanges();
         this.markMissing(file, changes);
         this.apply(changes);
       })
         .catch(error => { this.status.message = error.message; this.notify(); });
-    }).on('error', error => { this.status.message = `監視エラー: ${error.message}`; this.notify(); });
-    try { await once(watcher, 'ready', { signal: this.watcherLifetime.signal }); }
-    catch (error) { if (this.closed) return; throw error; }
-    // Reconcile changes that happened between the first scan and watcher readiness.
-    if (!this.closed) await this.rescan();
+    }).on('error', error => {
+      this.watchedRoots = null;
+      this.status.message = `監視エラー: ${error.message}`;
+      this.notify();
+    });
+    try {
+      await once(watcher, 'ready', { signal: this.watcherLifetime.signal });
+      if (this.closed) return;
+      const observedFiles = initialFiles;
+      initialFiles = null;
+      watcher.off('addDir', addDir).off('unlinkDir', unlinkDir);
+      this.watchedRoots = roots;
+      const unavailableRoot = paths.find(directory => unavailableRoots.has(normalize(directory)));
+      await this.reconcile({ observedFiles, unavailableRoot });
+    } catch (error) {
+      if (this.closed) return;
+      this.watcher = null;
+      this.watchedRoots = null;
+      await watcher.close();
+      throw error;
+    }
   }
 
   async addFolder(directory) {
     const absolute = path.resolve(directory);
     if (!(await fs.stat(absolute)).isDirectory()) throw new Error('フォルダを選んでください');
     if (this.ignored(absolute)) throw new Error('このフォルダは監視対象にできません');
-    await this.enqueue(() => {
-      if (!this.data.folders.some(folder => normalize(folder.path) === normalize(absolute))) {
-        const changes = newChanges();
-        const id = idFor(absolute);
-        changes.folders.set(id, { id, path: absolute });
-        this.apply(changes);
-      }
+    const key = normalize(absolute);
+    const added = await this.enqueue(() => {
+      if (this.data.folders.some(folder => normalize(folder.path) === key)) return false;
+      const changes = newChanges();
+      const id = idFor(absolute);
+      changes.folders.set(id, { id, path: absolute });
+      this.apply(changes);
+      return true;
     });
     await this.startWatchers();
-    // startWatchers performs a final scan; also scan when watching is disabled in tests.
-    if (this.options.watch === false) await this.rescan();
+    if (added && this.options.watch === false) await this.reconcile();
     return this.getState();
   }
 
@@ -411,24 +471,27 @@ class Library extends EventEmitter {
     const addedFolder = await this.enqueue(async () => {
       const changes = newChanges();
       const knownFolders = new Set(this.data.folders.map(folder => normalize(folder.path)));
+      const visited = new Set();
       for (const file of paths) {
-        const stat = await fs.stat(file);
+        const absolute = path.resolve(file);
+        if (visited.has(absolute)) continue;
+        visited.add(absolute);
+        const stat = await fs.stat(absolute);
         if (stat.isDirectory()) {
-          const absolute = path.resolve(file);
           if (this.ignored(absolute)) throw new Error('このフォルダは監視対象にできません');
           const key = normalize(absolute);
           if (knownFolders.has(key)) continue;
           knownFolders.add(key);
           const id = idFor(absolute);
           changes.folders.set(id, { id, path: absolute });
-        } else if (formatFor(file)) await this.upsert(file, changes, { explicit: true });
+        } else if (formatFor(absolute)) await this.upsert(absolute, changes, { explicit: true, stat });
       }
       this.apply(changes);
       return Boolean(changes.folders.size);
     });
     if (addedFolder) {
       await this.startWatchers();
-      if (this.options.watch === false) await this.rescan();
+      if (this.options.watch === false) await this.reconcile();
     }
     return this.getState();
   }
@@ -725,10 +788,10 @@ class Library extends EventEmitter {
     try {
       await this.watcherQueue;
       await this.initialScan;
-      await Promise.all(this.watchers.map(watcher => watcher.close()));
+      await this.watcher?.close();
     }
     finally {
-      this.watchers = [];
+      this.watcher = null;
       await this.queue;
       try { this.store?.close(); }
       finally { this.removeAllListeners(); }
