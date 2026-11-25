@@ -8,6 +8,8 @@ const localName = (node) => node.localName || node.local || node.nodeName.split(
 const attr = (node, name) => node?.getAttribute(name) || '';
 const VERTEX_ATTRS = ['v1', 'v2', 'v3'];
 const COLOR_ATTRS = ['p1', 'p2', 'p3'];
+const DEFAULT_RGB = Number.parseInt(DEFAULT_COLOR.slice(1), 16);
+const RGB_VALUES = 0x1000000;
 
 function children(node, name) {
   const result = [];
@@ -78,8 +80,49 @@ function transform(value) {
 }
 
 function parseColor(value) {
-  if (!/^#[\da-f]{6}([\da-f]{2})?$/i.test(value)) return new THREE.Color(DEFAULT_COLOR);
-  return new THREE.Color(value.slice(0, 7));
+  if (!/^#[\da-f]{6}([\da-f]{2})?$/i.test(value)) return DEFAULT_RGB;
+  return Number.parseInt(value.slice(1, 7), 16);
+}
+
+function indexedVertexAttributes(vertices, remap, usedCount, baseColors, splits, indices) {
+  const vertexCount = remap.length;
+  const compact = usedCount !== vertexCount;
+  const total = usedCount + splits.length;
+  const positions = compact || splits.length ? new Float32Array(total * 3) : vertices;
+  const colors = baseColors && new Float32Array(positions.length);
+  const linearColors = new Map();
+  function writeColor(rgb, offset) {
+    if (!linearColors.has(rgb)) linearColors.set(rgb, new THREE.Color(rgb));
+    linearColors.get(rgb).toArray(colors, offset);
+  }
+  function writePosition(source, offset) {
+    positions[offset] = vertices[source];
+    positions[offset + 1] = vertices[source + 1];
+    positions[offset + 2] = vertices[source + 2];
+  }
+
+  if (!compact && positions !== vertices) positions.set(vertices);
+  if (compact || colors) {
+    let next = 0;
+    for (let vertex = 0; vertex < vertexCount; vertex++) {
+      if (remap[vertex] < 0) continue;
+      remap[vertex] = next++;
+      if (compact) writePosition(vertex * 3, remap[vertex] * 3);
+      if (colors) writeColor(baseColors[vertex], remap[vertex] * 3);
+    }
+  }
+  for (const [offset, { vertex, rgb }] of splits.entries()) {
+    const target = (usedCount + offset) * 3;
+    writePosition(vertex * 3, target);
+    writeColor(rgb, target);
+  }
+  if (compact) {
+    for (let i = 0; i < indices.length; i++) {
+      const vertex = indices[i];
+      indices[i] = vertex < vertexCount ? remap[vertex] : usedCount + vertex - vertexCount;
+    }
+  }
+  return { positions, colors };
 }
 
 /** Inspect ZIP headers only: returning false for every member prevents inflation. */
@@ -215,52 +258,59 @@ export async function load3MF(buffer, { signal, limits = LIMITS, parseDocument =
       vertices[offset + 1] = finiteNumber(pointRows ? pointRows[offset + 1] : attr(node, 'y'), 'Y座標');
       vertices[offset + 2] = finiteNumber(pointRows ? pointRows[offset + 2] : attr(node, 'z'), 'Z座標');
     }
-    const positions = new Float32Array(meshTriangles * 9);
-    let colors;
-    const defaultColor = new THREE.Color(DEFAULT_COLOR);
+    const indices = new Uint32Array(meshTriangles * 3);
+    const remap = new Int32Array(vertexCount).fill(-1);
+    const splits = [];
+    const splitIndices = new Map();
+    let usedCount = 0;
+    let baseColors;
     const objectPID = attr(definition, 'pid');
     const objectPIndex = attr(definition, 'pindex') || '0';
-    let colored = false;
     for (let i = 0; i < meshTriangles; i++) {
+      if ((i & 0xfff) === 0) abortIfNeeded(signal);
       const triangle = indexRows ? triangleXML.triangleStyles?.get(i) : triangleNodes[i];
       if (attr(triangle, 'paint_color')) hasPaint = true;
       const pid = attr(triangle, 'pid') || objectPID;
       const palette = model.colors.get(pid);
       if (pid && !palette) unsupportedMaterial = true;
-      if (palette && !colors) {
-        colors = new Float32Array(positions.length);
-        for (let offset = 0; offset < colors.length; offset += 3) {
-          colors[offset] = defaultColor.r;
-          colors[offset + 1] = defaultColor.g;
-          colors[offset + 2] = defaultColor.b;
-        }
-      }
+      if (palette && !baseColors) baseColors = new Uint32Array(vertexCount).fill(DEFAULT_RGB);
       const first = attr(triangle, 'p1') || objectPIndex;
       for (let corner = 0; corner < 3; corner++) {
-        const vertex = integer(indexRows ? indexRows[i * 3 + corner] : attr(triangle, VERTEX_ATTRS[corner]), '頂点インデックス');
+        const offset = i * 3 + corner;
+        const vertex = integer(indexRows ? indexRows[offset] : attr(triangle, VERTEX_ATTRS[corner]), '頂点インデックス');
         if (vertex >= vertexCount) throw new Error('3MFの頂点参照が範囲外です');
-        const dest = i * 9 + corner * 3;
-        const source = vertex * 3;
-        positions[dest] = vertices[source];
-        positions[dest + 1] = vertices[source + 1];
-        positions[dest + 2] = vertices[source + 2];
         const pindex = attr(triangle, COLOR_ATTRS[corner]) || first;
-        const color = palette?.[integer(pindex, '色インデックス')] || defaultColor;
-        if (palette) colored = true;
-        if (colors) {
-          colors[dest] = color.r;
-          colors[dest + 1] = color.g;
-          colors[dest + 2] = color.b;
+        const rgb = palette?.[integer(pindex, '色インデックス')] ?? DEFAULT_RGB;
+        if (remap[vertex] < 0) {
+          remap[vertex] = vertex;
+          usedCount++;
+          if (baseColors) baseColors[vertex] = rgb;
+          indices[offset] = vertex;
+        } else if (baseColors && baseColors[vertex] !== rgb) {
+          // Position and color are indexed together. Reuse matching corners and
+          // duplicate a position only when a face needs a different color.
+          const key = vertex * RGB_VALUES + rgb;
+          if (!splitIndices.has(key)) {
+            splitIndices.set(key, vertexCount + splits.length);
+            splits.push({ vertex, rgb });
+          }
+          indices[offset] = splitIndices.get(key);
+        } else {
+          indices[offset] = vertex;
         }
       }
     }
+    const { positions, colors } = indexedVertexAttributes(vertices, remap, usedCount, baseColors, splits, indices);
     const geometry = new THREE.BufferGeometry();
     try {
       geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
-      if (colored) geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+      geometry.setIndex(new THREE.BufferAttribute(indices, 1));
+      if (colors) geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
       validateGeometry(geometry, limits);
-      geometry.computeVertexNormals();
-      const mesh = new THREE.Mesh(geometry, surfaceMaterial(colored ? { color: '#ffffff', vertexColors: true } : {}));
+      // Flat shader normals preserve the original face shading without storing
+      // a normal for every triangle corner.
+      const material = colors ? { color: '#ffffff', vertexColors: true } : {};
+      const mesh = new THREE.Mesh(geometry, surfaceMaterial({ ...material, flatShading: true }));
       allocated.add(mesh);
       return mesh;
     } catch (error) { geometry.dispose(); throw error; }

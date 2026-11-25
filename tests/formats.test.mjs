@@ -55,6 +55,24 @@ test('3MF base colors and geometry survive import', async () => {
   disposeModel(result.object);
 });
 
+test('3MF indices share matching corners and split only color seams', async () => {
+  const base = '<basematerials id="2"><base name="Black" displaycolor="#000000"/><base name="Red" displaycolor="#ff0000"/></basematerials>';
+  const mesh = meshXML([[0, 0, 0], [1, 0, 0], [0, 1, 0], [0, 0, 1], [100, 100, 100]], [[0, 1, 2], [0, 2, 3], [0, 2, 3]])
+    .replaceAll('<triangle v1="0" v2="2" v3="3"/>', '<triangle v1="0" v2="2" v3="3" pid="2" p1="0" p2="1" p3="0"/>');
+  const data = make3MF({ '3D/3dmodel.model': modelXML(`${base}<object id="1">${mesh}</object>`, '<item objectid="1"/>') });
+  const result = await loadModel(data, { filename: 'color-seam.3mf' });
+  const [object] = result.object.children;
+  const { position, color } = object.geometry.attributes;
+  assert.equal(position.count, 6);
+  assert.deepEqual([...object.geometry.index.array], [0, 1, 2, 4, 5, 3, 4, 5, 3]);
+  assert.deepEqual([0, 3, 4, 5].map((i) => new THREE.Color().fromBufferAttribute(color, i).getHexString()), ['a9c9cf', '000000', '000000', 'ff0000']);
+  assert.equal(object.material.flatShading, true);
+  assert.equal(object.geometry.getAttribute('normal'), undefined);
+  close(bounds(result.object).max.toArray(), [1, 1, 1]);
+  assert.equal(result.metadata.triangles, 3);
+  disposeModel(result.object);
+});
+
 test('mesh-free 3MF uses its embedded thumbnail without inventing dimensions', async () => {
   const png = Uint8Array.from(Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aX1sAAAAASUVORK5CYII=', 'base64'));
   const data = zipSync({ '3D/3dmodel.model': strToU8(modelXML('', '')), 'Metadata/plate_1.png': png });
@@ -280,7 +298,10 @@ test('on-demand mesh workers transfer owned data, preserve instances, and cancel
     assert.strictEqual(first.geometry, second.geometry);
     assert.strictEqual(first.material, second.material);
     assert.equal(first.material.vertexColors, true);
-    assert.equal(first.geometry.getAttribute('color').count, 36);
+    assert.equal(first.material.flatShading, true);
+    assert.equal(first.geometry.getAttribute('color').count, 8);
+    assert.equal(first.geometry.getAttribute('position').count, 8);
+    assert.equal(first.geometry.index.count, 36);
     assert.equal(model.metadata.triangles, 24);
     close(bounds(model.object).getSize(new THREE.Vector3()).toArray(), [50,30,10]);
     disposeModel(model.object);

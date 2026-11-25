@@ -1,7 +1,7 @@
 {
   "name": "nine-model-library",
   "productName": "Nine print model hub",
-  "version": "0.9.0",
+  "version": "0.9.1",
   "private": true,
   "license": "MPL-2.0",
   "description": "A local STL, STEP and 3MF library for makers",

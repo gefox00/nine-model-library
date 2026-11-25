@@ -44,8 +44,9 @@ export function surfaceMaterial(options = {}) {
 
 export function validateGeometry(geometry, limits = LIMITS) {
   const positions = geometry.getAttribute('position');
-  if (!positions || positions.count < 3) throw new Error('表示できる三角形がありません');
+  if (!positions?.count) throw new Error('表示できる三角形がありません');
   const count = geometry.index ? geometry.index.count : positions.count;
+  if (count < 3) throw new Error('表示できる三角形がありません');
   if (count % 3 !== 0) throw new Error('モデルの三角形データが不正です（頂点参照数が3の倍数ではありません）');
   if (count / 3 > limits.triangles) throw limitExceeded('モデルの三角形数', count / 3, limits.triangles, { hard: limits.triangles >= HARD_LIMITS.triangles });
   for (const value of positions.array) if (!Number.isFinite(value)) throw new Error('モデルに不正な座標が含まれています');

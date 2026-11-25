@@ -3,8 +3,8 @@
 This repository is a Windows desktop application for local 3D files. Start with
 [the architecture guide](docs/architecture.md) for code ownership and data flow;
 [`README.md`](README.md) covers usage, and [the MCP guide](docs/mcp.md) covers
-the read-only agent interface. Check [the roadmap](docs/roadmap.md) for current
-limits and measured changes.
+the read-only agent interface in the 0.9.x series. Check [the roadmap](docs/roadmap.md)
+for the v1.0 product decisions, deferred release criteria, and measured changes.
 Keep changes focused on the requested behavior and preserve existing library data.
 
 ## Change boundaries
@@ -61,7 +61,8 @@ Keep changes focused on the requested behavior and preserve existing library dat
   removal and moving the source to the Recycle Bin have different exclusion rules.
 - Bambu Studio receives the original STL, STEP or 3MF through the verified GUI
   executable without a shell. OpenSCAD uses a bounded temporary STL generated
-  from the current parameters. Confirm printer and send from Studio.
+  from the current parameters. Report handoff at the launch or open request.
+  Configure the printer, slice, and confirm sending in Studio.
 - OpenSCAD runs as an external process with no shell and the original source
   directory as its working directory. Only validated Customizer literals may
   become parameter overrides. Keep previews in temporary files and never

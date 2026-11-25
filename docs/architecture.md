@@ -45,7 +45,7 @@ to return local source paths or notes.
 | Native feature or new renderer capability | Guarded handler in `electron/main.cjs`, named API in `electron/preload.cjs` | Backend test plus actual IPC smoke |
 | Agent discovery and catalog reads | `electron/mcp-server.cjs`, `electron/mcp-catalog.cjs` | MCP client and SQLite reader tests |
 | Memory policy | `shared/preview-memory.json`, CJS/ESM policy helpers | `tests/preview-memory.test.mjs`, reader/adapter cases |
-| Thumbnail scheduling and renderer lifecycle | `electron/thumbnail-batch.cjs`, `electron/thumbnail-worker.cjs` | Batch/worker tests, thumbnail smoke |
+| Thumbnail scheduling, report persistence and renderer lifecycle | `electron/thumbnail-batch.cjs`, `electron/thumbnail-batch-store.cjs`, `electron/thumbnail-worker.cjs` | Batch/store/worker tests, thumbnail smoke |
 | Thumbnail image composition | `src/thumbnail-worker.js` | Nonblank-image checks in thumbnail smoke |
 | Thumbnail delivery | `electron/thumbnail-protocol.cjs`, `src/components/ModelThumbnail.jsx` | Protocol tests, thumbnail smoke |
 | Packaging or STEP runtime assets | `vite.config.js`, `scripts/copy-occt.mjs`, package build configuration | Build, package, packaged STEP/thumbnail smoke |
@@ -124,13 +124,18 @@ STL and 3MF workers transfer mesh arrays with precomputed bounds. Workers use a
 The thumbnail renderer shares the format adapters, with 3MF XML parsed in its
 isolated renderer and STEP converted in its WASM worker. The 3MF adapter resolves
 object IDs within each archive part and applies component/build transforms and
-units. It rejects cycles and reports unsupported paint or material features.
+units. It builds indexed geometry, preserves color boundaries at triangle corners,
+and uses flat shading to preserve the face normals. It rejects cycles and reports
+unsupported paint or material features.
 
 In lightweight mode, selecting a model shows catalog data and any cached image.
 An explicit preview starts loading. WebGL starts after a usable mesh is ready,
 draws on demand, and is released on close, replacement, or reload. Auto-rotation
 requests additional frames while visible. Changing the selection or cancelling
-the preview aborts its pending read or conversion.
+the preview aborts its pending read or conversion. Camera fitting and explicit
+reloads call the viewer directly. A memory setting saved by itself applies to
+the next load. Save-and-reload supplies the persisted budget for the current
+model, and a SCAD update supplies the selected parameter values for that render.
 
 When a foreground 3MF load fails, [`three-mf-thumbnail.cjs`](../electron/three-mf-thumbnail.cjs)
 can read the central directory and one PNG or JPEG by range from the source ZIP.
@@ -179,8 +184,9 @@ those options available in the explicit selection modes.
 [`bambu-print.cjs`](../electron/bambu-print.cjs) launches the verified Studio
 executable without a shell. It passes the original STL, STEP, or 3MF by path.
 For SCAD it stages a bounded temporary STL with the current parameters. A
-successful handoff means the Studio process launched. Printer selection, plate
-settings, slicing, and final send confirmation take place in Studio.
+successful handoff means the launch request with the file path was accepted.
+Printer selection, plate settings, slicing, and final send confirmation take
+place in Studio.
 
 ## Thumbnail runs
 
@@ -202,10 +208,10 @@ continues. Ordinary malformed-model failures retain the healthy window.
 
 `processed = succeeded + failed + skipped`. Cancellation can leave it below
 `total`. Reports carry counts, scope, timestamps, the current item, and errors.
-SQLite persists the latest run and imports the earlier `thumbnail-batch.json`
-when needed. A previously running or stopping report becomes cancelled after
-restart.
-`reportError` exposes persistence problems to the live UI.
+[`ThumbnailBatchStore`](../electron/thumbnail-batch-store.cjs) persists the latest
+run in SQLite and reads the earlier `thumbnail-batch.json` when SQLite has no
+report. `ThumbnailBatch` restores the report and marks a previously running or
+stopping run as cancelled. `reportError` exposes persistence problems to the live UI.
 
 Batch saves pass an expected source to `saveThumbnail()`, which checks the
 registered path/size/mtime and the actual file before committing the image.

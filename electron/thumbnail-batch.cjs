@@ -42,6 +42,14 @@ class ThumbnailBatch extends EventEmitter {
   getState() { return structuredClone(this.state); }
   isRunning() { return ['running', 'stopping'].includes(this.state.status); }
 
+  async restoreFrom(loadReport) {
+    try {
+      await this.restore(await loadReport());
+    } catch (error) {
+      if (error.code !== 'ENOENT') this.state.reportError = `前回の生成結果を読み込めません: ${error.message}`;
+    }
+  }
+
   async restore(report) {
     if (!report || typeof report !== 'object' || !['idle', 'running', 'stopping', 'completed', 'cancelled'].includes(report.status)) return this.getState();
     const clean = initialState();

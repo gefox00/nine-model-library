@@ -1,10 +1,11 @@
-import { useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useImperativeHandle, useRef, useState } from 'react';
 import * as THREE from 'three';
 import { loadModel, disposeModel } from '../formats/index.js';
 import { createViewerEngine, makeGround, fitCamera, setWireframe, captureThumbnail } from './model-viewer-engine.js';
 import './ModelViewer.css';
 
 export default function ModelViewer({
+  ref,
   item,
   onMetadata,
   onThumbnail,
@@ -12,11 +13,9 @@ export default function ModelViewer({
   showGrid = true,
   autoRotate = false,
   viewPreset = 'iso',
-  fitToken = 0,
   memoryBudgetMiB = 2048,
   manualMemoryBudgetMiB = memoryBudgetMiB,
   lightweightPreview = true,
-  reloadToken = 0,
   onCancel,
   onOpenMemorySettings,
   scadValues,
@@ -25,22 +24,34 @@ export default function ModelViewer({
 }) {
   const mountRef = useRef(null);
   const engineRef = useRef(null);
+  const disposePreviewRef = useRef(null);
   const callbacksRef = useRef({ onMetadata, onThumbnail });
-  const optionsRef = useRef({ viewMode, showGrid, autoRotate, viewPreset, memoryBudgetMiB, manualMemoryBudgetMiB, scadValues });
+  const optionsRef = useRef(null);
   const [phase, setPhase] = useState('empty');
   const [error, setError] = useState('');
   const [gridStep, setGridStep] = useState(null);
   const [previewImage, setPreviewImage] = useState(null);
-  const [retry, setRetry] = useState({ detailed: false });
+  const [detailed, setDetailed] = useState(false);
   callbacksRef.current = { onMetadata, onThumbnail };
-  optionsRef.current = { viewMode, showGrid, autoRotate, viewPreset, memoryBudgetMiB, manualMemoryBudgetMiB, scadValues };
-  const canRetryDetailed = !item?.missing && lightweightPreview && manualMemoryBudgetMiB > memoryBudgetMiB && !retry.detailed;
+  optionsRef.current = {
+    item, viewMode, showGrid, autoRotate, viewPreset,
+    memoryBudgetMiB, manualMemoryBudgetMiB, lightweightPreview, scadValues, scadExecutable,
+  };
+  const canRetryDetailed = !item?.missing && lightweightPreview && manualMemoryBudgetMiB > memoryBudgetMiB && !detailed;
 
   useEffect(() => { onPhaseChange?.(phase); }, [phase, onPhaseChange]);
 
-  useEffect(() => {
+  const loadPreview = useCallback((options = {}) => {
+    disposePreviewRef.current?.();
+    disposePreviewRef.current = null;
+
+    const {
+      item, memoryBudgetMiB, manualMemoryBudgetMiB, lightweightPreview,
+      scadValues, scadExecutable, detailed = false,
+    } = { ...optionsRef.current, ...options };
     const controller = new AbortController();
     const { signal } = controller;
+    setDetailed(detailed);
     setGridStep(null);
     setPreviewImage(null);
     setError('');
@@ -57,10 +68,10 @@ export default function ModelViewer({
     setPhase('loading');
     // Keep a single budget for disk reading and format expansion. Saving a new
     // setting alone must not unexpectedly restart a large model.
-    const loadBudgetMiB = retry.detailed ? optionsRef.current.manualMemoryBudgetMiB : optionsRef.current.memoryBudgetMiB;
-    const loadOptions = { memoryBudgetMiB: loadBudgetMiB, detailed: retry.detailed };
+    const loadBudgetMiB = detailed ? manualMemoryBudgetMiB : memoryBudgetMiB;
+    const loadOptions = { memoryBudgetMiB: loadBudgetMiB, detailed };
     const isScad = item.format === 'scad';
-    const overrides = optionsRef.current.scadValues || {};
+    const overrides = scadValues || {};
     let scadRequestId;
     let modelRequestId;
     let imageUrl;
@@ -103,7 +114,7 @@ export default function ModelViewer({
           throw new Error('モデルの座標に無効な値が含まれています');
         }
         try {
-          engine = createViewerEngine(mountRef.current, lightweightPreview && !retry.detailed, optionsRef);
+          engine = createViewerEngine(mountRef.current, lightweightPreview && !detailed, optionsRef);
           engineRef.current = engine;
         } catch (cause) {
           throw new Error(`3D表示を初期化できませんでした。${cause.message}`, { cause });
@@ -167,7 +178,7 @@ export default function ModelViewer({
         setPhase('error');
       }
     })();
-    return () => {
+    disposePreviewRef.current = () => {
       controller.abort();
       if (scadRequestId) window.nine.cancelScadRender(scadRequestId).catch(() => {});
       if (modelRequestId) window.nine.cancelModelRead(modelRequestId).catch(() => {});
@@ -175,7 +186,24 @@ export default function ModelViewer({
       engine?.dispose();
       if (engineRef.current === engine) engineRef.current = null;
     };
-  }, [item?.id, item?.modifiedAt, item?.missing, reloadToken, retry, scadExecutable, lightweightPreview]);
+  }, []);
+
+  useImperativeHandle(ref, () => ({
+    fit(preset = optionsRef.current.viewPreset) {
+      if (engineRef.current) fitCamera(engineRef.current, preset);
+    },
+    reload(itemId, options) {
+      if (optionsRef.current.item?.id === itemId) loadPreview({ detailed, ...options });
+    },
+  }), [detailed, loadPreview]);
+
+  useEffect(() => {
+    loadPreview();
+    return () => {
+      disposePreviewRef.current?.();
+      disposePreviewRef.current = null;
+    };
+  }, [item?.id, item?.path, item?.modifiedAt, item?.missing, scadExecutable, loadPreview]);
 
   useEffect(() => {
     const engine = engineRef.current;
@@ -191,16 +219,12 @@ export default function ModelViewer({
     if (engine.ground) engine.ground.visible = showGrid;
     engine.invalidate();
   }, [showGrid]);
-  useEffect(() => {
-    const engine = engineRef.current;
-    if (engine) fitCamera(engine, viewPreset);
-  }, [viewPreset, fitToken]);
   useEffect(() => { engineRef.current?.invalidate(); }, [autoRotate]);
 
   const retryActions = (phase === 'error' || previewImage?.fallback) && (
     <div className="model-viewer__error-actions">
-      <button type="button" onClick={() => setRetry({ detailed: retry.detailed })}>再読み込み</button>
-      {canRetryDetailed && <button type="button" onClick={() => setRetry({ detailed: true })}>詳細上限で再読み込み</button>}
+      <button type="button" onClick={() => loadPreview({ detailed })}>再読み込み</button>
+      {canRetryDetailed && <button type="button" onClick={() => loadPreview({ detailed: true })}>詳細上限で再読み込み</button>}
       {onOpenMemorySettings && <button type="button" onClick={onOpenMemorySettings}>プレビューメモリ設定</button>}
     </div>
   );

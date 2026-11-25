@@ -6,6 +6,7 @@ const { Library } = require('./library.cjs');
 const { chooseRelinkModel } = require('./model-relink-dialog.cjs');
 const { BambuPrint } = require('./bambu-print.cjs');
 const { ThumbnailBatch, abortError } = require('./thumbnail-batch.cjs');
+const { ThumbnailBatchStore } = require('./thumbnail-batch-store.cjs');
 const { ThumbnailWorker } = require('./thumbnail-worker.cjs');
 const scad = require('./scad-engine.cjs');
 const { ScadPresets, readCustomizerJson, writeCustomizerJson } = require('./scad-presets.cjs');
@@ -104,13 +105,7 @@ async function boot() {
   library.on('state', state => {
     if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('nine:state', state);
   });
-  const batchReportFile = path.join(app.getPath('userData'), 'thumbnail-batch.json');
-  library.database.exec(`CREATE TABLE IF NOT EXISTS thumbnail_batch_report (
-    id INTEGER PRIMARY KEY CHECK (id = 1), report_json TEXT NOT NULL
-  ) STRICT`);
-  const readBatchReport = library.database.prepare('SELECT report_json FROM thumbnail_batch_report WHERE id = 1');
-  const saveBatchReport = library.database.prepare(`INSERT INTO thumbnail_batch_report (id, report_json) VALUES (1, ?)
-    ON CONFLICT (id) DO UPDATE SET report_json = excluded.report_json`);
+  const batchStore = new ThumbnailBatchStore(library.database, app.getPath('userData'));
   const thumbnailWorker = new ThumbnailWorker({
     createWindow: () => new BrowserWindow({
       width: 512, height: 512, show: false, skipTaskbar: true, focusable: false,
@@ -130,19 +125,13 @@ async function boot() {
   thumbnailBatch = new ThumbnailBatch({
     generate: (item, options) => thumbnailWorker.generate(item, options),
     saveThumbnail: (item, result, { signal }) => library.saveThumbnail(item.id, result.dataUrl, item, { signal }),
-    persistReport: async report => { saveBatchReport.run(JSON.stringify(report)); },
+    persistReport: report => batchStore.save(report),
   });
   thumbnailBatch.on('state', state => {
     if (state.status !== 'running') thumbnailWorker.close();
     if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('nine:thumbnail-batch', state);
   });
-  try {
-    const saved = readBatchReport.get()?.report_json ?? await fs.readFile(batchReportFile, 'utf8');
-    await thumbnailBatch.restore(JSON.parse(saved));
-  }
-  catch (error) {
-    if (error.code !== 'ENOENT') thumbnailBatch.state.reportError = `前回の生成結果を読み込めません: ${error.message}`;
-  }
+  await thumbnailBatch.restoreFrom(() => batchStore.load());
   handle('getState', () => library.getState());
   handle('addFiles', async () => {
     const result = await dialog.showOpenDialog(mainWindow, { title: '3Dファイルを登録', properties: ['openFile', 'multiSelections'], filters: [

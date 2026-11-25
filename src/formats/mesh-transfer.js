@@ -34,8 +34,8 @@ export function encodeMeshResult({ object, ...result }) {
     if (materialIds.has(material)) return materialIds.get(material);
     const id = materials.length;
     materialIds.set(material, id);
-    const { color, vertexColors, opacity, transparent } = material;
-    materials.push({ color: color.toArray(), vertexColors, opacity, transparent });
+    const { color, vertexColors, opacity, transparent, flatShading } = material;
+    materials.push({ color: color.toArray(), vertexColors, opacity, transparent, flatShading });
     return id;
   }
 

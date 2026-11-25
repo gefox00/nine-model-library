@@ -1,11 +1,12 @@
 import React, { lazy, Suspense, useDeferredValue, useEffect, useMemo, useRef, useState } from 'react';
-import { Box, Boxes, Search, Plus, FolderPlus, Folder, Heart, Settings2, LayoutGrid, Rows3, RefreshCw, ArrowUpRight, X, FileBox, ChevronRight, Scan, Grid3X3, Rotate3D, Cuboid, Loader2, AlertCircle, Check, FolderOpen, Trash2, Tag, SlidersHorizontal, MousePointer2, HardDrive, Hexagon } from 'lucide-react';
+import { Box, Boxes, Search, Plus, FolderPlus, Folder, Heart, Settings2, LayoutGrid, Rows3, RefreshCw, ArrowUpRight, X, FileBox, ChevronRight, Cuboid, Loader2, AlertCircle, Check, FolderOpen, Trash2, Tag, SlidersHorizontal, MousePointer2, HardDrive, Hexagon } from 'lucide-react';
 import MemorySettings from './components/MemorySettings.jsx';
 import ThumbnailBatchPanel, { useThumbnailBatch } from './components/ThumbnailBatchPanel.jsx';
 import ModelContextMenu from './components/ModelContextMenu.jsx';
 import ModelThumbnail from './components/ModelThumbnail.jsx';
 import ScadPanel from './components/ScadPanel.jsx';
 import useScadWorkspace from './components/useScadWorkspace.js';
+import ViewerControls from './components/ViewerControls.jsx';
 import formats from '../shared/formats.json';
 import { effectivePreviewBudget } from './formats/preview-memory.js';
 import { productName, version } from '../package.json';
@@ -39,13 +40,12 @@ export default function App() {
   const [showGrid, setShowGrid] = useState(true);
   const [autoRotate, setAutoRotate] = useState(false);
   const [viewPreset, setViewPreset] = useState('iso');
-  const [fitToken, setFitToken] = useState(0);
-  const [reloadToken, setReloadToken] = useState(0);
   const [dragging, setDragging] = useState(false);
   const [tagText, setTagText] = useState('');
   const [notes, setNotes] = useState('');
   const searchRef = useRef(null);
   const collectionRef = useRef(null);
+  const viewerRef = useRef(null);
   const printPending = useRef(false);
   const toastTimer = useRef(null);
 
@@ -69,9 +69,14 @@ export default function App() {
   }, []);
   useEffect(() => {
     const handler = e => {
-      if ((e.ctrlKey || e.metaKey) && e.key === 'f') { e.preventDefault(); searchRef.current?.focus(); }
+      const key = e.key.toLowerCase();
+      if ((e.ctrlKey || e.metaKey) && key === 'f') {
+        e.preventDefault();
+        searchRef.current?.focus();
+        return;
+      }
       if (e.key === 'Escape') setSettingsOpen(false);
-      if (e.key.toLowerCase() === 'f' && !['INPUT', 'TEXTAREA'].includes(e.target.tagName)) setFitToken(t => t + 1);
+      if (key === 'f' && !['INPUT', 'TEXTAREA'].includes(e.target.tagName)) viewerRef.current?.fit();
     };
     window.addEventListener('keydown', handler);
     return () => window.removeEventListener('keydown', handler);
@@ -143,7 +148,7 @@ export default function App() {
       const result = await window.nine.prepareBambuPrint(item.id, values);
       if (result?.status === 'opened') {
         setPrintJob({ id: item.id, ...result });
-        notify('Bambu Studioに渡した。スライス後、プリンタと設定を確認して送信。');
+        notify('Bambu Studioにモデルを渡しました。以降はスライサーで操作してください。');
       } else setPrintJob(null);
     } catch (error) {
       setPrintJob(null);
@@ -216,7 +221,30 @@ export default function App() {
   async function saveMemorySettings(memoryBudgetMiB, lightweightPreview, reload) {
     const result = await action(() => window.nine.updateSettings({ memoryBudgetMiB, lightweightPreview }),
       reload ? 'メモリ設定を保存した。モデルを再読み込みする' : 'メモリ設定を保存した。次の読み込みから反映する');
-    if (result?.items && reload) { setSettingsOpen(false); setPreviewRequestedId(selectedId); setReloadToken(value => value + 1); }
+    if (result?.items && reload) {
+      setSettingsOpen(false);
+      setPreviewRequestedId(selectedId);
+      viewerRef.current?.reload(selectedId, {
+        memoryBudgetMiB: effectivePreviewBudget(result.settings),
+        manualMemoryBudgetMiB: result.settings.memoryBudgetMiB,
+        lightweightPreview: result.settings.lightweightPreview !== false,
+      });
+    }
+  }
+
+  function resetScadPreview() {
+    scad.resetValues();
+    if (previewVisible) viewerRef.current?.reload(scadItem.id, { scadValues: {} });
+  }
+
+  function applyScadPreview() {
+    if (lightweightPreview && generatingThumbnails) {
+      notify('サムネイル生成が終わってからプレビューしてください');
+      return;
+    }
+    scad.applyPreview();
+    setPreviewRequestedId(scadItem.id);
+    viewerRef.current?.reload(scadItem.id, { scadValues: scad.values });
   }
 
   if (!window.nine) return <div className="desktop-required"><Boxes size={56}/><h1>{productName}</h1><p>このアプリはデスクトップから起動して使う。</p><p>「{productName}.exe」または「起動.cmd」を開いてね。</p></div>;
@@ -275,11 +303,86 @@ export default function App() {
             <button type="button" aria-label="次のページ" disabled={activePage + 1 === pageCount} onClick={() => setPage(activePage + 1)}>次へ</button>
           </nav>}
         </section>
-        {selected && <><section className="preview-panel"><div className="preview-heading"><div><span className={`format-badge ${selected.format}`}>{formatName(selected.format)}</span><b title={selected.name}>{selected.name}</b></div><button className="icon-button" title="プレビューを閉じる" onClick={() => { setSelectedId(null); setPreviewRequestedId(null); }}><X size={18}/></button></div><div className="viewer-wrap">{previewVisible ? <><Suspense fallback={<div className="deferred-preview" role="status"><Loader2 size={20} className="spin"/></div>}><ModelViewer key={`${selected.id}:${selected.modifiedAt}`} item={selected} memoryBudgetMiB={memoryBudgetMiB} manualMemoryBudgetMiB={state.settings.memoryBudgetMiB} lightweightPreview={lightweightPreview} reloadToken={reloadToken} onCancel={() => { setPreviewRequestedId(null); setMetadata(null); }} onOpenMemorySettings={() => setSettingsOpen(true)} onMetadata={setMetadata} scadExecutable={scadItem ? scadExecutable : undefined} scadValues={scad.previewValues} onPhaseChange={scadItem ? setScadPreviewPhase : undefined} onThumbnail={dataUrl => window.nine.saveThumbnail(selected.id, dataUrl, { path: selected.path, size: selected.size, modifiedAt: selected.modifiedAt, addedAt: selected.addedAt }).catch(() => {})} viewMode={viewMode} showGrid={showGrid} autoRotate={autoRotate} viewPreset={viewPreset} fitToken={fitToken}/></Suspense><div className="viewer-tools"><button title="全体を表示 (F)" onClick={() => setFitToken(t => t+1)}><Scan size={18}/></button><span/><button title="ワイヤーフレーム" className={viewMode === 'wireframe' ? 'active' : ''} onClick={() => setViewMode(v => v === 'solid' ? 'wireframe' : 'solid')}><Cuboid size={18}/></button><button title="グリッド" className={showGrid ? 'active' : ''} onClick={() => setShowGrid(v => !v)}><Grid3X3 size={18}/></button><button title="自動回転" className={autoRotate ? 'active' : ''} onClick={() => setAutoRotate(v => !v)}><Rotate3D size={18}/></button></div><div className="view-presets">{[['iso','斜め'],['front','正面'],['top','上面'],['right','右面']].map(([key,label]) => <button className={viewPreset === key ? 'active' : ''} key={key} onClick={() => { setViewPreset(key); setFitToken(t => t+1); }}>{label}</button>)}</div></> : <div className="deferred-preview">
-          {selected.hasThumbnail && <ModelThumbnail item={selected}/>}
-          <button type="button" className="secondary-button" disabled={selected.missing || generatingThumbnails || printJob?.status === 'preparing'} onClick={() => selectModel(selected, true)}><Cuboid size={17}/>3Dプレビューを読み込む</button>
-          <p>{selected.missing ? '元ファイルが見つかりません' : generatingThumbnails ? 'サムネイル生成が終わると3Dを読み込めます' : '軽量モード · 3D表示は必要なときに読み込み'}</p>
-        </div>}</div><div className="viewer-footer"><span><MousePointer2 size={13}/>左ドラッグ: 回転 · 右: 移動 · ホイール: 拡大</span><span>mm</span></div></section>
+        {selected && <>
+          <section className="preview-panel">
+            <div className="preview-heading">
+              <div>
+                <span className={`format-badge ${selected.format}`}>{formatName(selected.format)}</span>
+                <b title={selected.name}>{selected.name}</b>
+              </div>
+              <button
+                type="button"
+                className="icon-button"
+                title="プレビューを閉じる"
+                onClick={() => { setSelectedId(null); setPreviewRequestedId(null); }}
+              >
+                <X size={18} />
+              </button>
+            </div>
+            <div className="viewer-wrap">
+              {previewVisible ? (
+                <>
+                  <Suspense fallback={<div className="deferred-preview" role="status"><Loader2 size={20} className="spin" /></div>}>
+                    <ModelViewer
+                      key={`${selected.id}:${selected.modifiedAt}`}
+                      ref={viewerRef}
+                      item={selected}
+                      memoryBudgetMiB={memoryBudgetMiB}
+                      manualMemoryBudgetMiB={state.settings.memoryBudgetMiB}
+                      lightweightPreview={lightweightPreview}
+                      onCancel={() => { setPreviewRequestedId(null); setMetadata(null); }}
+                      onOpenMemorySettings={() => setSettingsOpen(true)}
+                      onMetadata={setMetadata}
+                      scadExecutable={scadItem ? scadExecutable : undefined}
+                      scadValues={scad.previewValues}
+                      onPhaseChange={scadItem ? setScadPreviewPhase : undefined}
+                      onThumbnail={dataUrl => window.nine.saveThumbnail(selected.id, dataUrl, {
+                        path: selected.path,
+                        size: selected.size,
+                        modifiedAt: selected.modifiedAt,
+                        addedAt: selected.addedAt,
+                      }).catch(() => {})}
+                      viewMode={viewMode}
+                      showGrid={showGrid}
+                      autoRotate={autoRotate}
+                      viewPreset={viewPreset}
+                    />
+                  </Suspense>
+                  <ViewerControls
+                    viewMode={viewMode}
+                    showGrid={showGrid}
+                    autoRotate={autoRotate}
+                    viewPreset={viewPreset}
+                    onFit={() => viewerRef.current?.fit()}
+                    onToggleWireframe={() => setViewMode(mode => mode === 'solid' ? 'wireframe' : 'solid')}
+                    onToggleGrid={() => setShowGrid(visible => !visible)}
+                    onToggleAutoRotate={() => setAutoRotate(enabled => !enabled)}
+                    onSelectPreset={preset => {
+                      setViewPreset(preset);
+                      viewerRef.current?.fit(preset);
+                    }}
+                  />
+                </>
+              ) : (
+                <div className="deferred-preview">
+                  {selected.hasThumbnail && <ModelThumbnail item={selected} />}
+                  <button
+                    type="button"
+                    className="secondary-button"
+                    disabled={selected.missing || generatingThumbnails || printJob?.status === 'preparing'}
+                    onClick={() => selectModel(selected, true)}
+                  >
+                    <Cuboid size={17} />3Dプレビューを読み込む
+                  </button>
+                  <p>{selected.missing ? '元ファイルが見つかりません' : generatingThumbnails ? 'サムネイル生成が終わると3Dを読み込めます' : '軽量モード · 3D表示は必要なときに読み込み'}</p>
+                </div>
+              )}
+            </div>
+            <div className="viewer-footer">
+              <span><MousePointer2 size={13} />左ドラッグ: 回転 · 右: 移動 · ホイール: 拡大</span>
+              <span>mm</span>
+            </div>
+          </section>
         <aside className={scadItem ? "inspector scad-inspector" : "inspector"}><div className="inspector-title">モデル詳細<FileBox size={17}/></div><div className="inspector-scroll"><div className="detail-section"><label>ファイル名</label><h2>{selected.name}</h2><span className={`format-tag ${selected.format}`}>{formatName(selected.format)}</span><span className="detail-size">{formatSize(selected.size)}</span></div>
         {scadItem && <ScadPanel
           key={`${scadItem.id}:${scadItem.path}:${scadItem.modifiedAt}`}
@@ -288,8 +391,8 @@ export default function App() {
           values={scad.values}
           presets={scad.presets}
           onValuesChange={scad.setValues}
-          onReset={() => { scad.resetValues(); if (previewVisible) setReloadToken(token => token + 1); }}
-          onPreview={() => { if (lightweightPreview && generatingThumbnails) { notify('サムネイル生成が終わってからプレビューしてください'); return; } scad.applyPreview(); setPreviewRequestedId(scadItem.id); setReloadToken(token => token + 1); }}
+          onReset={resetScadPreview}
+          onPreview={applyScadPreview}
           previewPhase={previewVisible ? scadPreviewPhase : 'deferred'}
           onExport={scad.exportModel}
           onCancelExport={scad.cancelExport}

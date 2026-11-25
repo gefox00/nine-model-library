@@ -153,6 +153,10 @@ try {
   await info.scrollIntoViewIfNeeded();
   await page.screenshot({ path: path.join(out, 'openscad-export.png') });
 
+  await panel.getByRole('button', { name: 'パラメータを初期値に戻す', exact: true }).click();
+  assert.equal(await width.inputValue(), '20');
+  await page.waitForFunction(() => document.querySelector('.dimensions b')?.textContent === '20.00', null, { timeout: 30000 });
+
   const id = state.items.find(item => item.name === 'customizable-parts.scad').id;
   await page.evaluate(modelId => window.nine.updateItem(modelId, { notes: 'Preserve this note', favorite: true, tags: ['fixture'] }), id);
   await fs.rename(source, movedSource);
