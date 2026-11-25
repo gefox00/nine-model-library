@@ -1,4 +1,4 @@
-# Working on Nine Model Library
+# Working on Nine print model hub
 
 This repository is a Windows desktop application for local 3D files. Start with
 [the architecture guide](docs/architecture.md) for code ownership and data flow;
@@ -9,6 +9,9 @@ Keep changes focused on the requested behavior and preserve existing library dat
 
 - `electron/` owns filesystem access, persistence, native dialogs, process launch,
   and IPC. These modules use CommonJS (`.cjs`).
+- `electron/mcp-server.cjs` is a separate local stdio entry point. Keep stdout
+  reserved for MCP messages, require explicit opt-in for paths and notes, and
+  keep MCP catalog access read-only. Do not import the GUI entry point here.
 - `src/` owns React UI, Three.js rendering, and format adapters. It uses ES modules.
   Do not import Node.js APIs into a renderer or expose unrestricted IPC/filesystem
   access through a preload.

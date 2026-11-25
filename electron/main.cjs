@@ -1,5 +1,6 @@
 const { app, BrowserWindow, ipcMain, dialog, shell, protocol, session } = require('electron');
 const path = require('node:path');
+const { mkdirSync } = require('node:fs');
 const fs = require('node:fs/promises');
 const { Library } = require('./library.cjs');
 const { chooseRelinkModel } = require('./model-relink-dialog.cjs');
@@ -11,8 +12,10 @@ const { ScadPresets, readCustomizerJson, writeCustomizerJson } = require('./scad
 const formats = require('../shared/formats.json');
 const { assertMemoryBudget, effectivePreviewBudget } = require('../shared/preview-memory.cjs');
 const { THUMBNAIL_SCHEME, LIBRARY_SESSION, thumbnailRequestHandler } = require('./thumbnail-protocol.cjs');
+const { libraryDataDirectory } = require('../shared/app-profile.cjs');
+const { productName } = require('../package.json');
 
-app.setName('Nine Model Library');
+app.setName(productName);
 protocol.registerSchemesAsPrivileged([{ scheme: THUMBNAIL_SCHEME, privileges: { standard: true } }]);
 let library;
 let mainWindow;
@@ -23,18 +26,25 @@ const scadRenders = new Map();
 let scadExport = null;
 let quitting = false;
 
-if (process.env.NINE_DATA_DIR) app.setPath('userData', path.resolve(process.env.NINE_DATA_DIR));
-const hasLock = process.env.NINE_TEST_MODE || app.requestSingleInstanceLock();
-if (!hasLock) app.quit();
-else {
+async function startApp() {
+  const profile = libraryDataDirectory(app.getPath('appData'), process.env.NINE_DATA_DIR);
+  mkdirSync(profile, { recursive: true });
+  app.setPath('userData', profile);
+  if (!process.env.NINE_TEST_MODE && !app.requestSingleInstanceLock()) {
+    app.quit();
+    return;
+  }
   app.on('second-instance', () => {
     if (mainWindow) { if (mainWindow.isMinimized()) mainWindow.restore(); mainWindow.focus(); }
   });
-  app.whenReady().then(boot).catch(error => {
-    dialog.showErrorBox('Nine Model Library を起動できません', error.message);
-    app.quit();
-  });
+  await app.whenReady();
+  await boot();
 }
+
+startApp().catch(error => {
+  dialog.showErrorBox(`${productName} を起動できません`, error.message);
+  app.quit();
+});
 
 function handle(name, callback) {
   ipcMain.handle(`nine:${name}`, (event, ...args) => {
@@ -360,7 +370,7 @@ function validateScadRequestId(requestId) {
 
 function createWindow() {
   mainWindow = new BrowserWindow({
-    title: 'Nine Model Library', width: 1520, height: 960, minWidth: 1100, minHeight: 720,
+    title: productName, width: 1520, height: 960, minWidth: 1100, minHeight: 720,
     backgroundColor: '#0b1015', autoHideMenuBar: true, show: false,
     webPreferences: { preload: path.join(__dirname, 'preload.cjs'), partition: LIBRARY_SESSION,
       nodeIntegration: false, contextIsolation: true, sandbox: true, webSecurity: true },

@@ -1,12 +1,12 @@
-# Nine Model Library
+# Nine print model hub
 
 Windows用のローカル3Dファイルライブラリ。STL / STEP・STP / 3MF / OpenSCAD を一覧表示できます。OpenSCADのモデルは公開パラメータを調整し、3D表示やSTL出力ができます。
 
-開発を引き継ぐときは [AGENTS.md](AGENTS.md)、[設計・データの流れ](docs/architecture.md)、[評価とロードマップ](docs/roadmap.md) を参照してください。
+AIエージェントからライブラリを使う場合は [MCPの接続方法](docs/mcp.md) を参照してください。開発を引き継ぐときは [AGENTS.md](AGENTS.md)、[設計・データの流れ](docs/architecture.md)、[評価とロードマップ](docs/roadmap.md) を参照してください。
 
 ## 起動
 
-`起動.cmd` をダブルクリックしてください。配布版の実行ファイルは `release/win-unpacked/Nine Model Library.exe` です。実行ファイルを移動するときは **win-unpackedフォルダ全体** を移動します。配布版の実行にNode.jsは不要です。
+`起動.cmd` をダブルクリックしてください。配布版の実行ファイルは `release/win-unpacked/Nine print model hub.exe` です。実行ファイルを移動するときは **win-unpackedフォルダ全体** を移動します。配布版の実行にNode.jsは不要です。
 
 アプリは登録したファイルを現在の保存場所から参照します。印刷準備ではSTL・STEP・3MFの元ファイルをBambu Studioに渡し、SCADは選んだパラメータで一時STLを生成します。
 
@@ -62,7 +62,7 @@ Bambu / Orca独自のペイント色、テクスチャ、複合マテリアル�
 
 ## 保存データ
 
-通常は `%APPDATA%/Nine Model Library/library.sqlite3` に登録情報、監視フォルダ、タグ、メモ、サムネイル、設定、OpenSCADプリセットを保存します。初回起動時に旧 `library.json` の内容を取り込み、旧ファイルを残します。DBが読めない場合は起動エラーを表示し、旧データへの自動巻き戻しは行いません。バックアップはアプリを完全に終了してから、このデータフォルダごとコピーしてください。
+通常は `%APPDATA%/Nine Model Library/library.sqlite3` に登録情報、監視フォルダ、タグ、メモ、サムネイル、設定、OpenSCADプリセットを保存します。名称変更後も同じフォルダを使います。旧版から切り替える際は旧版を終了してから新しい実行ファイルを開いてください。初回起動時に旧 `library.json` の内容を取り込み、旧ファイルを残します。DBが読めない場合は起動エラーを表示し、旧データへの自動巻き戻しは行いません。バックアップはアプリを完全に終了してから、このデータフォルダごとコピーしてください。
 
 同じパスの二重登録は防ぎます。同一内容でも別の保存場所なら別モデルとして扱います。移動したモデルは「元ファイルを再指定」で旧登録に戻せます。移動先に独立したタグ、メモ、お気に入りやプリセットがある場合は、それぞれの登録を残します。
 
@@ -113,7 +113,7 @@ OpenSCADをインストールした環境では、`node scripts/smoke-scad.mjs` 
 
 ## ライセンス
 
-Nine Model Libraryのオリジナルソースコードには Mozilla Public License 2.0（`MPL-2.0`）を適用します。ライセンス全文は [LICENSE](LICENSE) にあります。
+Nine print model hubのオリジナルソースコードには Mozilla Public License 2.0（`MPL-2.0`）を適用します。ライセンス全文は [LICENSE](LICENSE) にあります。
 
 Electron、React、Three.js、chokidar、fflate、occt-import-jsなどの依存ライブラリには、それぞれのライセンスが適用されます。各ライブラリのライセンス文書を参照してください。
 

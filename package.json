@@ -1,6 +1,7 @@
 {
   "name": "nine-model-library",
-  "version": "0.7.0",
+  "productName": "Nine print model hub",
+  "version": "0.8.0",
   "private": true,
   "license": "MPL-2.0",
   "description": "A local STL, STEP and 3MF library for makers",
@@ -15,15 +16,18 @@
     "package": "npm run build && electron-builder --win --dir"
   },
   "dependencies": {
+    "@modelcontextprotocol/server": "2.4.0",
     "chokidar": "^4.0.3",
     "fflate": "^0.8.2",
     "lucide-react": "^0.468.0",
     "occt-import-js": "^0.0.23",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
-    "three": "^0.183.0"
+    "three": "^0.183.0",
+    "zod": "4.6.7"
   },
   "devDependencies": {
+    "@modelcontextprotocol/client": "2.4.0",
     "@vitejs/plugin-react": "^4.3.4",
     "@xmldom/xmldom": "^0.8.11",
     "electron": "^40.0.0",
@@ -33,7 +37,6 @@
   },
   "build": {
     "appId": "local.nine-model-library.desktop",
-    "productName": "Nine Model Library",
     "electronDist": "node_modules/electron/dist",
     "directories": {
       "output": "release"
@@ -44,7 +47,9 @@
       "shared/**/*",
       "package.json"
     ],
-    "extraFiles": ["LICENSE"],
+    "extraFiles": [
+      "LICENSE"
+    ],
     "win": {
       "target": "dir",
       "signAndEditExecutable": false

@@ -4,11 +4,12 @@ import path from 'node:path';
 import assert from 'node:assert/strict';
 import { unzipSync, zipSync, strToU8, strFromU8 } from 'fflate';
 import { fileURLToPath } from 'node:url';
+import manifest from '../package.json' with { type: 'json' };
 
 const root = fileURLToPath(new URL('../', import.meta.url));
 const packaged = process.argv.includes('--packaged');
 const releaseDirectory = process.argv.find(arg => arg.startsWith('--release-dir='))?.slice('--release-dir='.length) || 'release';
-const executablePath = packaged ? path.resolve(root, releaseDirectory, 'win-unpacked/Nine Model Library.exe')
+const executablePath = packaged ? path.resolve(root, releaseDirectory, 'win-unpacked', `${manifest.productName}.exe`)
   : path.join(root, 'node_modules/electron/dist/electron.exe');
 const args = packaged ? [] : ['.'];
 const out = path.join(root,'output/playwright');

@@ -8,8 +8,9 @@ import ScadPanel from './components/ScadPanel.jsx';
 import useScadWorkspace from './components/useScadWorkspace.js';
 import formats from '../shared/formats.json';
 import { effectivePreviewBudget } from './formats/preview-memory.js';
-import { version } from '../package.json';
+import { productName, version } from '../package.json';
 
+const [brandName, ...brandDescription] = productName.split(' ');
 const blank = { items: [], folders: [], settings: {}, status: {} };
 const PAGE_SIZE = 48;
 const ModelViewer = lazy(() => import('./components/ModelViewer.jsx'));
@@ -218,11 +219,11 @@ export default function App() {
     if (result?.items && reload) { setSettingsOpen(false); setPreviewRequestedId(selectedId); setReloadToken(value => value + 1); }
   }
 
-  if (!window.nine) return <div className="desktop-required"><Boxes size={56}/><h1>Nine Model Library</h1><p>このアプリはデスクトップから起動して使う。</p><p>「Nine Model Library.exe」または「起動.cmd」を開いてね。</p></div>;
+  if (!window.nine) return <div className="desktop-required"><Boxes size={56}/><h1>{productName}</h1><p>このアプリはデスクトップから起動して使う。</p><p>「{productName}.exe」または「起動.cmd」を開いてね。</p></div>;
 
   return <div className="app-shell" onDragOver={e => { e.preventDefault(); if (e.dataTransfer.types.includes('Files')) setDragging(true); }} onDragLeave={e => { if (!e.currentTarget.contains(e.relatedTarget)) setDragging(false); }} onDrop={drop}>
     <aside className="sidebar">
-      <div className="brand"><span className="brand-mark"><Boxes size={27}/></span><div><b>NINE</b><span>MODEL LIBRARY</span></div><span className="version">01</span></div>
+      <div className="brand" title={productName}><span className="brand-mark"><Boxes size={27}/></span><div><b>{brandName}</b><span>{brandDescription.join(' ')}</span></div><span className="version">01</span></div>
       <div className="workspace-label"><span className="status-dot"/> LOCAL WORKSPACE</div>
       <div className="nav-label">ライブラリ</div>
       <button className={`nav-item ${section === 'all' ? 'active' : ''}`} onClick={() => setSection('all')}><LayoutGrid size={18}/>すべてのモデル<span>{state.items.length}</span></button>
@@ -323,6 +324,6 @@ export default function App() {
   <div className="path-field">{scadExecutable || "未検出 — 実行ファイルを指定してね"}</div>
   <button className="secondary-button" onClick={() => action(() => window.nine.chooseOpenScad())}><FolderOpen size={15}/>OpenSCADの実行ファイルを選択</button>
 </div>
-<div className="settings-section"><h3><Folder size={18}/>監視フォルダ</h3><p>サブフォルダも対象。追加・変更・削除を自動で反映する。</p>{state.folders.map(folder => <div className="settings-folder" key={folder.id}><Folder size={15}/><span title={folder.path}>{folder.path}</span><button className="icon-button" title="フォルダの監視を解除" onClick={() => action(() => window.nine.removeFolder(folder.id), 'フォルダの監視を解除した')}><X size={15}/></button></div>)}<button className="secondary-button" onClick={addFolder}><FolderPlus size={15}/>監視フォルダを追加</button></div><div className="settings-section about-section"><Hexagon size={24}/><div><b>Nine Model Library <small>{version}</small></b><p>ファイル管理・形式アダプタ・3Dビューを分離した、拡張できるローカルライブラリ。</p></div></div></section></div>}
+<div className="settings-section"><h3><Folder size={18}/>監視フォルダ</h3><p>サブフォルダも対象。追加・変更・削除を自動で反映する。</p>{state.folders.map(folder => <div className="settings-folder" key={folder.id}><Folder size={15}/><span title={folder.path}>{folder.path}</span><button className="icon-button" title="フォルダの監視を解除" onClick={() => action(() => window.nine.removeFolder(folder.id), 'フォルダの監視を解除した')}><X size={15}/></button></div>)}<button className="secondary-button" onClick={addFolder}><FolderPlus size={15}/>監視フォルダを追加</button></div><div className="settings-section about-section"><Hexagon size={24}/><div><b>{productName} <small>{version}</small></b><p>ファイル管理・形式アダプタ・3Dビューを分離した、拡張できるローカルライブラリ。</p></div></div></section></div>}
   </div>;
 }

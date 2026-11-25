@@ -1,6 +1,6 @@
 # Architecture and change guide
 
-Nine Model Library separates native file management, geometry loading, and the
+Nine print model hub separates native file management, geometry loading, and the
 desktop UI. Features are added in source and rebuilt; there is no runtime plugin
 installer. The application keeps references to original files and uses derived
 geometry only for display.
@@ -56,6 +56,7 @@ loading.
 | Registration, watching, metadata or schema | `electron/library.cjs`, `electron/library-store.cjs` | `tests/library.test.cjs` |
 | Bambu Studio print handoff | `electron/bambu-print.cjs` | `tests/bambu-print.test.cjs` |
 | Native feature or new renderer capability | Guarded handler in `electron/main.cjs`, named API in `electron/preload.cjs` | Backend test plus actual IPC smoke |
+| Agent discovery and catalog reads | `electron/mcp-server.cjs`, `electron/mcp-catalog.cjs` | MCP client and SQLite reader tests |
 | Memory policy | `shared/preview-memory.json`, CJS/ESM policy helpers | `tests/preview-memory.test.mjs`, reader/adapter cases |
 | Thumbnail scheduling and renderer lifecycle | `electron/thumbnail-batch.cjs`, `electron/thumbnail-worker.cjs` | Batch/worker tests, thumbnail smoke |
 | Thumbnail image composition | `src/thumbnail-worker.js` | Nonblank-image checks in thumbnail smoke |
@@ -65,6 +66,8 @@ loading.
 ## Library state and persistence
 
 `Library` owns `library.sqlite3` under Electron's `userData` directory.
+`shared/app-profile.cjs` keeps the original `Nine Model Library` profile folder
+for both Electron and MCP regardless of the display name.
 `NINE_DATA_DIR` overrides that directory. `NINE_TEST_MODE` bypasses the
 single-instance lock; it does not select a separate directory or disable file
 operations. UI snapshots include transient `status` and OS memory information

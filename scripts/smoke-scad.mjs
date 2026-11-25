@@ -3,11 +3,13 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import manifest from '../package.json' with { type: 'json' };
 
 const root = fileURLToPath(new URL('../', import.meta.url));
 const packaged = process.argv.includes('--packaged');
 const releaseDirectory = process.argv.find(arg => arg.startsWith('--release-dir='))?.slice('--release-dir='.length) || 'release';
-const exe = path.join(root, packaged ? `${releaseDirectory}/win-unpacked/Nine Model Library.exe` : 'node_modules/electron/dist/electron.exe');
+const exe = packaged ? path.resolve(root, releaseDirectory, 'win-unpacked', `${manifest.productName}.exe`)
+  : path.join(root, 'node_modules/electron/dist/electron.exe');
 const out = path.join(root, 'output', 'playwright');
 await fs.mkdir(out, { recursive: true });
 const temp = await fs.mkdtemp(path.join(out, 'scad-'));
@@ -46,8 +48,11 @@ function stlDimensions(stl) {
 const app = await electron.launch({ executablePath: exe, args: packaged ? [] : ['.'], cwd: root, env, timeout: 40000 });
 try {
   const page = await app.firstWindow();
-  assert.equal(await app.evaluate(({ app }) => app.getVersion()), JSON.parse(await fs.readFile(path.join(root, 'package.json'), 'utf8')).version, exe);
+  assert.equal(await app.evaluate(({ app }) => app.getVersion()), manifest.version, exe);
+  assert.equal(await app.evaluate(({ app }) => app.getName()), manifest.productName);
+  assert.equal(await app.evaluate(({ app }) => app.getPath('userData')), data);
   await page.waitForFunction(() => window.nine?.getScadParameters);
+  assert.equal(await page.title(), manifest.productName);
   await app.evaluate(({ dialog }, { folders, presetJson, importJson, movedSource }) => {
     dialog.showOpenDialog = async (_window, options) => {
       if (options.title === 'OpenSCADプリセットJSONを読み込む') return { canceled: false, filePaths: [importJson] };
